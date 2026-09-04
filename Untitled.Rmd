@@ -1,0 +1,2871 @@
+---
+title: "Invisible Debt Trap Analytics"
+output: html_document
+date: "2026-05-26"
+author: SHah Md Anasullah
+---
+```{r setup, include=FALSE}
+
+# This chunk controls how the whole document behaves when it knits.
+# We are turning off warnings and messages globally because they clutter
+# the PDF output. The code itself still runs — we just hide the noise.
+
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 9,
+  fig.height = 5,
+  fig.align  = "center"
+)
+```
+
+```{r load-libraries}
+
+# Loading everything we need upfront so nothing breaks midway.
+# Each package has one job — tidyverse handles data and charts,
+# the rest handle modelling, evaluation, and table formatting.
+
+library(tidyverse)
+library(readxl)
+library(caret)
+library(rpart)
+library(rpart.plot)
+library(randomForest)
+library(pROC)
+library(corrplot)
+library(gridExtra)
+library(scales)
+library(knitr)
+library(kableExtra)
+```
+```{r project-note}
+
+# ── Project Context ──────────────────────────────────────────────────────────
+#
+# This demonstration uses the UCI Default of Credit Card Clients dataset
+# (Yeh & Lien, 2009) as a structural proxy for individual-level credit
+# behaviour modelling.
+#
+# The data comes from Taiwan in 2005. We are not claiming it directly
+# represents Australian consumers. We are using it to show that the
+# Invisible Debt Trap Flag — inspired by ASIC REP 788 indicators — is
+# technically feasible to build using machine learning on repayment data.
+#
+# Australian market context is provided separately through RBA C1 and C1.2
+# official statistics, which are analysed in a later section.
+#
+# Citation:
+# Yeh, I-C. and Lien, C.H. (2009). The comparisons of data mining techniques
+# for the predictive accuracy of probability of default of credit card clients.
+# Expert Systems with Applications, 36(2), 2473–2480.
+# DOI: https://doi.org/10.24432/C55S3H
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Project context noted. Proceeding with analysis.\n")
+```
+
+```{r load-data}
+
+# Reading the CSV file from the dataset subfolder.
+# We are keeping stringsAsFactors as FALSE so R does not automatically
+# convert text columns into factors — we will handle that ourselves later
+# when we know exactly which columns need it.
+
+uci_raw <- read.csv("dataset/UCI_Credit_Card.csv", 
+                    stringsAsFactors = FALSE)
+
+# Quick confirmation that the file came in correctly
+cat("Rows loaded:   ", nrow(uci_raw), "\n")
+cat("Columns loaded:", ncol(uci_raw), "\n")
+```
+```{r first-look}
+
+# The first thing we always do after loading a new dataset is just look at it.
+# This tells us the column names, what types R has assigned to each column,
+# and the first few values so we can spot anything obviously wrong.
+
+print(glimpse(uci_raw))
+```
+```{r drop-id}
+
+# The ID column is just a row number — it has no analytical value.
+# If we leave it in, some models might accidentally use it as a feature,
+# which would give us meaningless results. We remove it now.
+
+uci <- uci_raw %>%
+  select(-ID)
+
+cat("ID column removed.\n")
+cat("Working dataset now has", ncol(uci), "columns.\n")
+```
+```{r missing-values}
+
+# Before doing anything else, we check if any data is missing.
+# Missing values can silently break model training or skew results
+# if we do not handle them deliberately.
+
+missing_count <- sum(is.na(uci))
+
+if (missing_count == 0) {
+  cat("Good news — no missing values found anywhere in the dataset.\n")
+  cat("We can proceed without any imputation or row removal.\n")
+} else {
+  cat("Missing values detected:", missing_count, "\n")
+  cat("Columns affected:\n")
+  print(colSums(is.na(uci))[colSums(is.na(uci)) > 0])
+}
+```
+```{r data-cleaning}
+
+# ── Fixing Known Data Quality Problems ───────────────────────────────────────
+#
+# UCI has a few documented inconsistencies that we need to fix before
+# any analysis. These are well known in the literature and affect how
+# we interpret the demographic columns.
+#
+# Problem 1 — EDUCATION column
+# The codebook says valid values are: 1=graduate, 2=university,
+# 3=high school, 4=others. But the dataset also contains 0, 5 and 6,
+# which are not explained anywhere. We recode these to 4 (others)
+# so they do not sit outside the valid range and confuse the model.
+#
+# Problem 2 — MARRIAGE column
+# Valid values are 1=married, 2=single, 3=others.
+# Some rows have 0, which again has no documentation.
+# We recode 0 to 3 (others) for the same reason.
+#
+# Problem 3 — PAY columns (repayment status)
+# Value -1 means the customer paid in full that month.
+# Value -2 also appears and likely means no consumption or balance.
+# Both mean the customer is NOT delayed, so we treat -2 the same as -1.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_clean <- uci %>%
+  mutate(
+    EDUCATION = case_when(
+      EDUCATION %in% c(0, 5, 6) ~ 4,
+      TRUE ~ EDUCATION
+    ),
+    MARRIAGE = case_when(
+      MARRIAGE == 0 ~ 3,
+      TRUE ~ MARRIAGE
+    ),
+    PAY_0 = ifelse(PAY_0 == -2, -1, PAY_0),
+    PAY_2 = ifelse(PAY_2 == -2, -1, PAY_2),
+    PAY_3 = ifelse(PAY_3 == -2, -1, PAY_3),
+    PAY_4 = ifelse(PAY_4 == -2, -1, PAY_4),
+    PAY_5 = ifelse(PAY_5 == -2, -1, PAY_5),
+    PAY_6 = ifelse(PAY_6 == -2, -1, PAY_6)
+  )
+
+# Confirm the cleaning worked as expected
+cat("Cleaning complete.\n\n")
+cat("EDUCATION values now:", sort(unique(uci_clean$EDUCATION)), "\n")
+cat("MARRIAGE values now: ", sort(unique(uci_clean$MARRIAGE)), "\n")
+cat("PAY_0 min value now: ", min(uci_clean$PAY_0), "\n")
+```
+
+```{r full-audit}
+
+# ── Full Data Quality Audit ───────────────────────────────────────────────────
+#
+# The basic cleaning fixed the known issues. But we should also check
+# for duplicates, unexpected values in other columns, negative amounts
+# where they should not exist, and extreme outliers that could distort
+# our models. This is what a proper data audit looks like.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── 1. Duplicate rows ────────────────────────────────────────────────────────
+# If two rows are identical in every column, one is likely a data entry error.
+
+dup_count <- sum(duplicated(uci_clean))
+cat("Duplicate rows found:", dup_count, "\n\n")
+
+
+# ── 2. SEX column ────────────────────────────────────────────────────────────
+# Valid values are 1=male and 2=female only.
+# Anything outside this range is an undocumented value.
+
+cat("SEX unique values:", sort(unique(uci_clean$SEX)), "\n")
+cat("SEX value counts:\n")
+print(table(uci_clean$SEX))
+cat("\n")
+
+
+# ── 3. LIMIT_BAL — credit limit ──────────────────────────────────────────────
+# Credit limits should always be positive.
+# A zero credit limit makes no sense — the customer would not have a card.
+
+cat("LIMIT_BAL minimum value:", min(uci_clean$LIMIT_BAL), "\n")
+cat("LIMIT_BAL maximum value:", max(uci_clean$LIMIT_BAL), "\n")
+cat("Rows where LIMIT_BAL is zero or negative:",
+    sum(uci_clean$LIMIT_BAL <= 0), "\n\n")
+
+
+# ── 4. AGE — customer age ────────────────────────────────────────────────────
+# Ages below 18 or above 100 are almost certainly data errors.
+
+cat("AGE minimum value:", min(uci_clean$AGE), "\n")
+cat("AGE maximum value:", max(uci_clean$AGE), "\n")
+cat("Rows where AGE is below 18:", sum(uci_clean$AGE < 18), "\n")
+cat("Rows where AGE is above 100:", sum(uci_clean$AGE > 100), "\n\n")
+
+
+# ── 5. PAY_AMT columns — payment amounts ─────────────────────────────────────
+# Payment amounts should never be negative.
+# A negative payment amount has no logical meaning.
+
+pay_amt_cols <- c("PAY_AMT1", "PAY_AMT2", "PAY_AMT3",
+                  "PAY_AMT4", "PAY_AMT5", "PAY_AMT6")
+
+cat("Negative values in PAY_AMT columns:\n")
+for (col in pay_amt_cols) {
+  neg_count <- sum(uci_clean[[col]] < 0)
+  cat(" ", col, ":", neg_count, "negative values\n")
+}
+cat("\n")
+
+
+# ── 6. BILL_AMT columns — bill amounts ───────────────────────────────────────
+# Bill amounts CAN be negative in credit cards.
+# A negative bill means the bank owes the customer money
+# (e.g. a refund was processed and it exceeded the balance).
+# This is valid — we just want to know how many there are.
+
+bill_amt_cols <- c("BILL_AMT1", "BILL_AMT2", "BILL_AMT3",
+                   "BILL_AMT4", "BILL_AMT5", "BILL_AMT6")
+
+cat("Negative values in BILL_AMT columns (valid — credit balance):\n")
+for (col in bill_amt_cols) {
+  neg_count <- sum(uci_clean[[col]] < 0)
+  cat(" ", col, ":", neg_count, "negative values\n")
+}
+cat("\n")
+
+
+# ── 7. Target variable check ─────────────────────────────────────────────────
+# The target should only contain 0 or 1. Nothing else.
+
+cat("Target variable unique values:",
+    sort(unique(uci_clean$default.payment.next.month)), "\n")
+cat("Any unexpected target values (not 0 or 1):",
+    sum(!uci_clean$default.payment.next.month %in% c(0, 1)), "\n\n")
+
+
+# ── 8. LIMIT_BAL outliers ────────────────────────────────────────────────────
+# Extremely high credit limits could be genuine (wealthy customers)
+# or data errors. We flag anything above 800,000 NT$ for awareness.
+
+high_limit <- sum(uci_clean$LIMIT_BAL > 800000)
+cat("Rows with credit limit above 800,000 NT$:", high_limit, "\n")
+cat("This is", round(high_limit / nrow(uci_clean) * 100, 1),
+    "% of the dataset\n\n")
+
+
+# ── 9. Bill amount vs credit limit check ─────────────────────────────────────
+# Bill amounts should not realistically exceed the credit limit by a large
+# margin. A bill far above the credit limit could indicate a data error.
+# We check Month 1 as a representative sample.
+
+over_limit <- sum(uci_clean$BILL_AMT1 > uci_clean$LIMIT_BAL * 1.1)
+cat("Rows where Bill Amount Month 1 exceeds credit limit by 10%+:",
+    over_limit, "\n")
+cat("This is", round(over_limit / nrow(uci_clean) * 100, 1),
+    "% of the dataset\n\n")
+
+
+cat("─────────────────────────────────────────────────\n")
+cat("Audit complete. Review findings above before proceeding.\n")
+```
+
+```{r remove-duplicates}
+
+# ── Removing Duplicate Rows ───────────────────────────────────────────────────
+#
+# We found 36 rows that are exact duplicates of other rows.
+# These are almost certainly data entry errors — the same customer
+# recorded twice. Keeping them would give those customers double weight
+# in the model, which is not fair or accurate.
+#
+# We use distinct() to keep only unique rows.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+rows_before <- nrow(uci_clean)
+
+uci_clean <- uci_clean %>%
+  distinct()
+
+rows_after <- nrow(uci_clean)
+
+cat("Rows before removing duplicates:", rows_before, "\n")
+cat("Rows after removing duplicates: ", rows_after, "\n")
+cat("Duplicate rows removed:         ", rows_before - rows_after, "\n\n")
+
+
+# ── Documenting Known Data Characteristics ────────────────────────────────────
+#
+# These findings from the audit are valid data characteristics,
+# not errors. We document them here for transparency in the report.
+#
+# 1. Negative BILL_AMT values (~2% of rows per month):
+#    These represent credit balances — situations where refunds or
+#    overpayments resulted in the bank owing the customer money.
+#    These are kept as-is because they reflect real customer behaviour.
+#
+# 2. 497 rows where bill exceeds credit limit (1.7% of data):
+#    Interest charges and fees applied on top of an already-full
+#    balance can push the total bill above the credit limit.
+#    This is a normal credit card phenomenon and these rows are kept.
+#
+# 3. 1 row with credit limit of 1,000,000 NT$:
+#    This is one customer with a very high limit. It is kept because
+#    it represents a real (if unusual) customer in the dataset.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Data characteristics documented.\n")
+cat("Final clean dataset ready:", nrow(uci_clean), "rows,",
+    ncol(uci_clean), "columns.\n")
+```
+
+```{r fix-remaining-issues}
+
+# ── Fix 1: Standardise Column Names ──────────────────────────────────────────
+#
+# Every column is uppercase with underscores except the target variable
+# which uses dots and lowercase. We rename it to match the rest.
+# Consistent naming prevents confusion when referencing columns in code.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_clean <- uci_clean %>%
+  rename(DEFAULT = default.payment.next.month)
+
+cat("Target column renamed to DEFAULT\n")
+cat("Column names now:\n")
+print(names(uci_clean))
+cat("\n")
+
+
+# ── Fix 2: Convert Categorical Columns to Labelled Factors ───────────────────
+#
+# SEX, EDUCATION and MARRIAGE are categories, not numbers.
+# If we leave them as integers, R will treat age=2 as twice as much as age=1
+# which makes no mathematical sense for a category.
+# We convert them to factors with meaningful labels so R handles them correctly
+# in charts and model training.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_clean <- uci_clean %>%
+  mutate(
+    SEX = factor(SEX,
+                 levels = c(1, 2),
+                 labels = c("Male", "Female")),
+
+    EDUCATION = factor(EDUCATION,
+                       levels = c(1, 2, 3, 4),
+                       labels = c("Graduate", "University",
+                                  "High School", "Others")),
+
+    MARRIAGE = factor(MARRIAGE,
+                      levels = c(1, 2, 3),
+                      labels = c("Married", "Single", "Others")),
+
+    DEFAULT = factor(DEFAULT,
+                     levels = c(0, 1),
+                     labels = c("No Default", "Default"))
+  )
+
+cat("Categorical columns converted to factors.\n")
+cat("SEX levels:      ", levels(uci_clean$SEX), "\n")
+cat("EDUCATION levels:", levels(uci_clean$EDUCATION), "\n")
+cat("MARRIAGE levels: ", levels(uci_clean$MARRIAGE), "\n")
+cat("DEFAULT levels:  ", levels(uci_clean$DEFAULT), "\n\n")
+
+
+# ── Fix 3: Check Financial Column Outliers ────────────────────────────────────
+#
+# We use the IQR method to detect extreme outliers in the bill and payment
+# columns. An extreme outlier is a value that sits more than 3 times the
+# interquartile range above the 75th percentile.
+# We do not automatically remove these — we just count them and decide
+# whether they are genuine or errors.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+financial_cols <- c("BILL_AMT1", "BILL_AMT2", "BILL_AMT3",
+                    "PAY_AMT1",  "PAY_AMT2",  "PAY_AMT3")
+
+cat("Extreme outlier check on financial columns (IQR method):\n")
+
+for (col in financial_cols) {
+
+  col_values <- uci_clean[[col]]
+  Q1         <- quantile(col_values, 0.25)
+  Q3         <- quantile(col_values, 0.75)
+  IQR_val    <- Q3 - Q1
+  upper_fence <- Q3 + 3 * IQR_val
+
+  outlier_count <- sum(col_values > upper_fence)
+
+  cat(" ", col, "— upper fence:", comma(round(upper_fence)),
+      "| extreme outliers:", outlier_count,
+      "(", round(outlier_count / nrow(uci_clean) * 100, 1), "%)\n")
+}
+
+cat("\n")
+cat("Note: Extreme outliers in financial columns are kept.\n")
+cat("They likely represent genuinely high-balance customers,\n")
+cat("not data entry errors. Removing them would bias the model.\n\n")
+
+
+# ── Final Dataset Summary ─────────────────────────────────────────────────────
+
+cat("─────────────────────────────────────────────────\n")
+cat("Final clean dataset summary:\n")
+cat("Rows:    ", nrow(uci_clean), "\n")
+cat("Columns: ", ncol(uci_clean), "\n")
+cat("Factor columns: SEX, EDUCATION, MARRIAGE, DEFAULT\n")
+cat("Numeric columns: all remaining\n")
+cat("Missing values: ", sum(is.na(uci_clean)), "\n")
+cat("─────────────────────────────────────────────────\n")
+```
+
+```{r pay-column-note}
+
+# ── PAY Column Naming Note ────────────────────────────────────────────────────
+#
+# You will notice the repayment status columns go:
+# PAY_0, PAY_2, PAY_3, PAY_4, PAY_5, PAY_6
+#
+# PAY_1 does not exist in this dataset. This is a known quirk
+# of the original UCI data — it was never included by the authors.
+# It is not a loading error on our end. The six months of repayment
+# history are still complete, just named this way.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+pay_cols <- names(uci_clean)[grepl("^PAY_", names(uci_clean))]
+cat("PAY status columns present:", pay_cols, "\n")
+cat("Note: PAY_1 is absent — this is a known original dataset issue.\n")
+```
+
+```{r feature-utilisation}
+
+# ── Feature 1: Utilisation Rate ───────────────────────────────────────────────
+#
+# This tells us how much of the credit limit the customer is actually using
+# on average across the six months we have data for.
+#
+# A customer using 80% or more of their limit consistently is a warning sign
+# — it means they have very little breathing room left on their card.
+#
+# Formula: average bill amount across 6 months divided by credit limit.
+#
+# Two edge cases to handle:
+# 1. Negative bill amounts (credit balance) — we treat these as zero usage.
+#    The customer is not using their limit, the bank owes them money.
+# 2. Values above 1.0 — bills can slightly exceed the limit due to interest
+#    and fees. We cap at 1.0 so the rate stays between 0 and 1.
+#
+# This feature is inspired by ASIC REP 788's persistent debt indicator
+# which flags accounts where average balance stays at 90%+ of credit limit.
+# We use this as a proxy — not a direct replication — because our data
+# does not include Australian interest-charged month records.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_features <- uci_clean %>%
+  mutate(
+    # Replace negative bill amounts with 0 before calculating
+    bill_m1 = pmax(BILL_AMT1, 0),
+    bill_m2 = pmax(BILL_AMT2, 0),
+    bill_m3 = pmax(BILL_AMT3, 0),
+    bill_m4 = pmax(BILL_AMT4, 0),
+    bill_m5 = pmax(BILL_AMT5, 0),
+    bill_m6 = pmax(BILL_AMT6, 0),
+
+    # Calculate average bill across 6 months then divide by credit limit
+    avg_bill = (bill_m1 + bill_m2 + bill_m3 +
+                bill_m4 + bill_m5 + bill_m6) / 6,
+
+    # Divide by credit limit — cap at 1.0
+    UTIL_RATE = pmin(avg_bill / LIMIT_BAL, 1.0)
+  ) %>%
+  # Remove the helper columns we created — keep things clean
+  select(-bill_m1, -bill_m2, -bill_m3,
+         -bill_m4, -bill_m5, -bill_m6, -avg_bill)
+
+
+# Check the result looks sensible
+cat("UTIL_RATE summary:\n")
+print(summary(uci_features$UTIL_RATE))
+cat("\nRows where utilisation is above 80%:",
+    sum(uci_features$UTIL_RATE > 0.8),
+    "(", round(mean(uci_features$UTIL_RATE > 0.8) * 100, 1), "%)\n")
+```
+
+```{r feature-repayment-ratio}
+
+# ── Feature 2: Repayment Ratio ────────────────────────────────────────────────
+#
+# This tells us how much of the bill the customer is actually paying back
+# each month on average. A low ratio means they are barely touching the debt.
+#
+# For example, a ratio of 0.05 means the customer is paying back only 5%
+# of their bill each month — the other 95% rolls over to next month.
+# That is the revolving trap in action.
+#
+# Formula: average payment amount divided by average bill amount
+# across the six months.
+#
+# Two edge cases to handle carefully:
+#
+# 1. When the bill amount is zero or negative (customer has a credit balance
+#    or no balance that month), there is nothing to pay back.
+#    We set the ratio to 1.0 for that month — fully covered.
+#
+# 2. When the payment exceeds the bill (customer overpaid), the ratio
+#    would go above 1.0. We cap it at 1.0 — you cannot repay more than 100%.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_features <- uci_features %>%
+  mutate(
+
+    # Calculate repayment ratio for each month individually
+    # When bill is zero or negative, ratio is 1.0 (nothing owed)
+    ratio_m1 = ifelse(BILL_AMT1 <= 0, 1.0,
+                      pmin(PAY_AMT1 / BILL_AMT1, 1.0)),
+
+    ratio_m2 = ifelse(BILL_AMT2 <= 0, 1.0,
+                      pmin(PAY_AMT2 / BILL_AMT2, 1.0)),
+
+    ratio_m3 = ifelse(BILL_AMT3 <= 0, 1.0,
+                      pmin(PAY_AMT3 / BILL_AMT3, 1.0)),
+
+    ratio_m4 = ifelse(BILL_AMT4 <= 0, 1.0,
+                      pmin(PAY_AMT4 / BILL_AMT4, 1.0)),
+
+    ratio_m5 = ifelse(BILL_AMT5 <= 0, 1.0,
+                      pmin(PAY_AMT5 / BILL_AMT5, 1.0)),
+
+    ratio_m6 = ifelse(BILL_AMT6 <= 0, 1.0,
+                      pmin(PAY_AMT6 / BILL_AMT6, 1.0)),
+
+    # Average the monthly ratios across all six months
+    REPAY_RATIO = (ratio_m1 + ratio_m2 + ratio_m3 +
+                   ratio_m4 + ratio_m5 + ratio_m6) / 6
+
+  ) %>%
+  # Remove the monthly helper columns
+  select(-ratio_m1, -ratio_m2, -ratio_m3,
+         -ratio_m4, -ratio_m5, -ratio_m6)
+
+
+# Check the result looks sensible
+cat("REPAY_RATIO summary:\n")
+print(summary(uci_features$REPAY_RATIO))
+
+cat("\nCustomers paying back less than 10% of their bill on average:",
+    sum(uci_features$REPAY_RATIO < 0.10),
+    "(", round(mean(uci_features$REPAY_RATIO < 0.10) * 100, 1), "%)\n")
+
+cat("Customers paying back less than 20% of their bill on average:",
+    sum(uci_features$REPAY_RATIO < 0.20),
+    "(", round(mean(uci_features$REPAY_RATIO < 0.20) * 100, 1), "%)\n")
+```
+
+```{r feature-min-repayment}
+
+# ── Feature 3: Minimum Repayment Frequency ────────────────────────────────────
+#
+# This counts how many months out of six the customer made only a
+# very small payment — specifically 3% or less of their credit limit.
+#
+# Why 3% of the credit limit? This threshold is inspired by ASIC REP 788
+# which flags repeated low repayments as a problem debt indicator when
+# a customer pays 3% or less of their limit for 8 or more months.
+# We use this as a proxy across our 6-month window.
+#
+# A customer who hits this threshold in 4 out of 6 months is showing
+# a persistent pattern of making the bare minimum payment — which means
+# their debt is barely moving.
+#
+# The result is a count from 0 to 6.
+# 0 = the customer always paid more than the minimum
+# 6 = the customer paid at or below the minimum every single month
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_features <- uci_features %>%
+  mutate(
+
+    # 3% of credit limit is our minimum repayment threshold
+    min_threshold = LIMIT_BAL * 0.03,
+
+    # Check each month — did the customer pay at or below the threshold?
+    low_pay_m1 = as.integer(PAY_AMT1 <= min_threshold),
+    low_pay_m2 = as.integer(PAY_AMT2 <= min_threshold),
+    low_pay_m3 = as.integer(PAY_AMT3 <= min_threshold),
+    low_pay_m4 = as.integer(PAY_AMT4 <= min_threshold),
+    low_pay_m5 = as.integer(PAY_AMT5 <= min_threshold),
+    low_pay_m6 = as.integer(PAY_AMT6 <= min_threshold),
+
+    # Count how many months the customer hit the low payment threshold
+    MIN_PAY_FREQ = low_pay_m1 + low_pay_m2 + low_pay_m3 +
+                   low_pay_m4 + low_pay_m5 + low_pay_m6
+
+  ) %>%
+  # Remove all helper columns
+  select(-min_threshold,
+         -low_pay_m1, -low_pay_m2, -low_pay_m3,
+         -low_pay_m4, -low_pay_m5, -low_pay_m6)
+
+
+# Check the distribution of results
+cat("MIN_PAY_FREQ summary:\n")
+print(summary(uci_features$MIN_PAY_FREQ))
+
+cat("\nDistribution — how many months at minimum payment:\n")
+print(table(uci_features$MIN_PAY_FREQ))
+
+cat("\nCustomers with low payments in 4 or more months out of 6:",
+    sum(uci_features$MIN_PAY_FREQ >= 4),
+    "(", round(mean(uci_features$MIN_PAY_FREQ >= 4) * 100, 1), "%)\n")
+```
+
+```{r feature-balance-persistence}
+
+# ── Feature 4: Balance Persistence Proxy ─────────────────────────────────────
+#
+# This counts how many months the customer's bill amount was sitting
+# above 80% of their credit limit.
+#
+# When a balance stays consistently close to the credit limit month
+# after month, it means the customer is not meaningfully reducing their
+# debt — they are stuck near the ceiling.
+#
+# This is a proxy inspired by ASIC REP 788's persistent debt definition,
+# which flags accounts where the average balance stays at 90% or more of
+# the credit limit for 12 or more months. We use 80% as a slightly earlier
+# warning threshold across our 6-month window.
+#
+# Important: we only apply this check when the bill amount is positive.
+# A negative bill means the customer has a credit balance — they are
+# definitely not in a high-balance situation that month.
+#
+# The result is a count from 0 to 6.
+# 0 = balance was below 80% of limit every month
+# 6 = balance was above 80% of limit every single month
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_features <- uci_features %>%
+  mutate(
+
+    # 80% of credit limit is our persistence threshold
+    persist_threshold = LIMIT_BAL * 0.80,
+
+    # Check each month — was the bill above 80% of the credit limit?
+    # We only flag positive bill amounts (negative = credit balance, not stress)
+    persist_m1 = as.integer(BILL_AMT1 > 0 & BILL_AMT1 > persist_threshold),
+    persist_m2 = as.integer(BILL_AMT2 > 0 & BILL_AMT2 > persist_threshold),
+    persist_m3 = as.integer(BILL_AMT3 > 0 & BILL_AMT3 > persist_threshold),
+    persist_m4 = as.integer(BILL_AMT4 > 0 & BILL_AMT4 > persist_threshold),
+    persist_m5 = as.integer(BILL_AMT5 > 0 & BILL_AMT5 > persist_threshold),
+    persist_m6 = as.integer(BILL_AMT6 > 0 & BILL_AMT6 > persist_threshold),
+
+    # Count how many months the balance was persistently high
+    BAL_PERSIST = persist_m1 + persist_m2 + persist_m3 +
+                  persist_m4 + persist_m5 + persist_m6
+
+  ) %>%
+  # Remove all helper columns
+  select(-persist_threshold,
+         -persist_m1, -persist_m2, -persist_m3,
+         -persist_m4, -persist_m5, -persist_m6)
+
+
+# Check the distribution of results
+cat("BAL_PERSIST summary:\n")
+print(summary(uci_features$BAL_PERSIST))
+
+cat("\nDistribution — how many months balance above 80% of limit:\n")
+print(table(uci_features$BAL_PERSIST))
+
+cat("\nCustomers with high balance in 4 or more months out of 6:",
+    sum(uci_features$BAL_PERSIST >= 4),
+    "(", round(mean(uci_features$BAL_PERSIST >= 4) * 100, 1), "%)\n")
+```
+
+```{r feature-payment-delay}
+
+# ── Feature 5: Payment Delay Count ───────────────────────────────────────────
+#
+# This counts how many months the customer had a delayed payment —
+# meaning they did not pay by the due date.
+#
+# In the UCI dataset, the PAY columns use this coding:
+# -1 = paid in full that month
+#  0 = minimum payment was made
+#  1 = payment was one month late
+#  2 = payment was two months late
+#  (and so on up to 8)
+#
+# We count any month where the PAY value is greater than 0 as a delay.
+# Even one month of delay is a warning sign. Multiple months of delay
+# is a strong signal of debt stress.
+#
+# The result is a count from 0 to 6.
+# 0 = no delays at all across six months — customer always paid on time
+# 6 = the customer had a payment delay every single month
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_features <- uci_features %>%
+  mutate(
+
+    # Check each month — was there any payment delay?
+    delay_m1 = as.integer(PAY_0 > 0),
+    delay_m2 = as.integer(PAY_2 > 0),
+    delay_m3 = as.integer(PAY_3 > 0),
+    delay_m4 = as.integer(PAY_4 > 0),
+    delay_m5 = as.integer(PAY_5 > 0),
+    delay_m6 = as.integer(PAY_6 > 0),
+
+    # Count how many months had a payment delay
+    PAY_DELAY_COUNT = delay_m1 + delay_m2 + delay_m3 +
+                      delay_m4 + delay_m5 + delay_m6
+
+  ) %>%
+  # Remove all helper columns
+  select(-delay_m1, -delay_m2, -delay_m3,
+         -delay_m4, -delay_m5, -delay_m6)
+
+
+# Check the distribution of results
+cat("PAY_DELAY_COUNT summary:\n")
+print(summary(uci_features$PAY_DELAY_COUNT))
+
+cat("\nDistribution — how many months with payment delay:\n")
+print(table(uci_features$PAY_DELAY_COUNT))
+
+cat("\nCustomers with at least one payment delay:",
+    sum(uci_features$PAY_DELAY_COUNT >= 1),
+    "(", round(mean(uci_features$PAY_DELAY_COUNT >= 1) * 100, 1), "%)\n")
+
+cat("Customers with 3 or more months of delay:",
+    sum(uci_features$PAY_DELAY_COUNT >= 3),
+    "(", round(mean(uci_features$PAY_DELAY_COUNT >= 3) * 100, 1), "%)\n")
+```
+
+```{r verify-features}
+
+# Quick check to confirm all five engineered features are present
+# and their value ranges make sense before we build the flag system
+
+cat("=== ENGINEERED FEATURES VERIFICATION ===\n\n")
+
+cat("1. UTIL_RATE (0 to 1):\n")
+cat("   Min:", round(min(uci_features$UTIL_RATE), 3),
+    "| Max:", round(max(uci_features$UTIL_RATE), 3),
+    "| Mean:", round(mean(uci_features$UTIL_RATE), 3), "\n\n")
+
+cat("2. REPAY_RATIO (0 to 1):\n")
+cat("   Min:", round(min(uci_features$REPAY_RATIO), 3),
+    "| Max:", round(max(uci_features$REPAY_RATIO), 3),
+    "| Mean:", round(mean(uci_features$REPAY_RATIO), 3), "\n\n")
+
+cat("3. MIN_PAY_FREQ (0 to 6):\n")
+cat("   Min:", min(uci_features$MIN_PAY_FREQ),
+    "| Max:", max(uci_features$MIN_PAY_FREQ),
+    "| Mean:", round(mean(uci_features$MIN_PAY_FREQ), 2), "\n\n")
+
+cat("4. BAL_PERSIST (0 to 6):\n")
+cat("   Min:", min(uci_features$BAL_PERSIST),
+    "| Max:", max(uci_features$BAL_PERSIST),
+    "| Mean:", round(mean(uci_features$BAL_PERSIST), 2), "\n\n")
+
+cat("5. PAY_DELAY_COUNT (0 to 6):\n")
+cat("   Min:", min(uci_features$PAY_DELAY_COUNT),
+    "| Max:", max(uci_features$PAY_DELAY_COUNT),
+    "| Mean:", round(mean(uci_features$PAY_DELAY_COUNT), 2), "\n\n")
+
+cat("Total rows in dataset:", nrow(uci_features), "\n")
+cat("All five features confirmed present:", 
+    all(c("UTIL_RATE", "REPAY_RATIO", "MIN_PAY_FREQ",
+          "BAL_PERSIST", "PAY_DELAY_COUNT") %in% names(uci_features)),
+    "\n")
+```
+
+
+```{r debt-trap-flag}
+
+# ── Building the Invisible Debt Trap Flag ─────────────────────────────────────
+
+# High Risk is assigned through direct conditions because payment delays
+# and extreme balance combinations are clear unambiguous signals.
+#
+# For the remaining three categories we use a stress score built from
+# four signals. Each signal that fires adds one point to the score.
+#
+# Two calibration decisions made from the actual data distribution:
+#
+# 1. Early Flag threshold set at score >= 2, not >= 3.
+#    Requiring 3 out of 4 signals simultaneously outside High Risk
+#    was too restrictive — almost no customers reached it.
+#
+# 2. Minimum payment signal widened to MIN_PAY_FREQ >= 5, not == 6.
+#    Using exactly 6 was too narrow — it excluded customers who showed
+#    minimum payment behaviour in 5 out of 6 months.
+#
+# These thresholds are ASIC-inspired proxies across a 6-month window,
+# not a direct replication of ASIC REP 788's Australian conditions.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+uci_features <- uci_features %>%
+  mutate(
+
+    # ── High Risk — direct conditions ────────────────────────────────────────
+    # Very high balance with almost no repayment
+    # OR regular payment delays — both are clear unambiguous signals
+
+    high_risk_flag = (UTIL_RATE > 0.80 & REPAY_RATIO < 0.10) |
+                      PAY_DELAY_COUNT >= 3,
+
+
+    # ── Stress score — four selective signals ────────────────────────────────
+    # Each targets a distinct stress pattern in the data
+
+    # Very high credit utilisation
+    sig_util     = as.integer(UTIL_RATE > 0.75),
+
+    # Very low repayment relative to bill amount
+    sig_repay    = as.integer(REPAY_RATIO < 0.10),
+
+    # Minimum payments in 5 or all 6 months
+    sig_min_pay  = as.integer(MIN_PAY_FREQ >= 5),
+
+    # Balance persistently near the limit for 4 or more months
+    sig_persist  = as.integer(BAL_PERSIST >= 4),
+
+    STRESS_SCORE = sig_util + sig_repay + sig_min_pay + sig_persist,
+
+
+    # ── Final flag assignment ────────────────────────────────────────────────
+    # High Risk first — then score determines the rest
+    # Early Flag at score >= 2 means two stress signals firing together
+
+    DEBT_FLAG = case_when(
+      high_risk_flag             ~ "High Risk",
+      STRESS_SCORE >= 2          ~ "Early Flag",
+      STRESS_SCORE == 1          ~ "Watch",
+      STRESS_SCORE == 0          ~ "Stable"
+    ),
+
+    DEBT_FLAG = factor(DEBT_FLAG,
+                       levels  = c("Stable", "Watch",
+                                   "Early Flag", "High Risk"),
+                       ordered = TRUE)
+
+  ) %>%
+  select(-high_risk_flag, -sig_util, -sig_repay,
+         -sig_min_pay, -sig_persist)
+
+
+# Check the final distribution
+cat("=== INVISIBLE DEBT TRAP FLAG DISTRIBUTION ===\n\n")
+
+flag_dist <- table(uci_features$DEBT_FLAG)
+flag_pct  <- round(prop.table(flag_dist) * 100, 1)
+
+for (flag in names(flag_dist)) {
+  cat(sprintf("%-12s : %5d customers ( %4.1f%% )\n",
+              flag, flag_dist[flag], flag_pct[flag]))
+}
+
+cat("\nTotal customers flagged:", nrow(uci_features), "\n")
+
+cat("\nStress score distribution (non-High-Risk customers only):\n")
+non_hr <- uci_features %>% filter(DEBT_FLAG != "High Risk")
+print(table(non_hr$STRESS_SCORE))
+```
+
+```{r flag-visualisation}
+
+# Now that the flag distribution looks reasonable, we visualise it.
+# A clean bar chart with counts and percentages makes this immediately
+# readable in the final report without needing to scan a table.
+
+flag_colours <- c(
+  "Stable"     = "#27AE60",
+  "Watch"      = "#F39C12",
+  "Early Flag" = "#E67E22",
+  "High Risk"  = "#C0392B"
+)
+
+flag_data <- uci_features %>%
+  count(DEBT_FLAG) %>%
+  mutate(
+    Percentage = round(n / sum(n) * 100, 1),
+    Label      = paste0(comma(n), "\n(", Percentage, "%)")
+  )
+
+ggplot(flag_data, aes(x = DEBT_FLAG, y = n, fill = DEBT_FLAG)) +
+  geom_bar(stat = "identity", width = 0.55, colour = "white") +
+  geom_text(
+    aes(label = Label),
+    vjust  = -0.3,
+    size   = 3.8,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = flag_colours) +
+  scale_y_continuous(
+    labels = comma,
+    limits = c(0, 15000)
+  ) +
+  labs(
+    title    = "Invisible Debt Trap Flag — Customer Distribution",
+    subtitle = "UCI Credit Card Default Dataset (Taiwan 2005) | Structural proxy for debt stress modelling",
+    x        = "Risk Category",
+    y        = "Number of Customers",
+    caption  = "Source: Yeh & Lien (2009) | UCI ML Repository | DOI: 10.24432/C55S3H"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position    = "none",
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40", size = 10),
+    panel.grid.major.x = element_blank()
+  )
+```
+
+```{r flag-validation}
+
+# ── Validating the Flag Against Actual Default Outcomes ───────────────────────
+#
+# This is the most important check for the flag system.
+# If our Invisible Debt Trap Flag is meaningful, we should see a clear
+# pattern — customers in higher risk categories should default at
+# significantly higher rates than those in lower categories.
+#
+# If Stable and High Risk customers default at similar rates,
+# our flag is not adding any value. This chart proves it either way.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+flag_default <- uci_features %>%
+  group_by(DEBT_FLAG) %>%
+  summarise(
+    Total_Customers  = n(),
+    Defaulted        = sum(DEFAULT == "Default"),
+    Default_Rate_Pct = round(Defaulted / Total_Customers * 100, 1)
+  )
+
+# Print the table first
+cat("=== DEFAULT RATE BY FLAG CATEGORY ===\n\n")
+print(flag_default)
+
+# Visualise the default rate by flag category
+flag_colours <- c(
+  "Stable"     = "#27AE60",
+  "Watch"      = "#F39C12",
+  "Early Flag" = "#E67E22",
+  "High Risk"  = "#C0392B"
+)
+
+ggplot(flag_default,
+       aes(x = DEBT_FLAG, y = Default_Rate_Pct, fill = DEBT_FLAG)) +
+  geom_bar(stat = "identity", width = 0.55, colour = "white") +
+  geom_text(
+    aes(label = paste0(Default_Rate_Pct, "%")),
+    vjust    = -0.4,
+    size     = 4.5,
+    fontface = "bold"
+  ) +
+  scale_fill_manual(values = flag_colours) +
+  scale_y_continuous(
+    limits = c(0, 80),
+    labels = function(x) paste0(x, "%")
+  ) +
+  labs(
+    title    = "Default Rate by Invisible Debt Trap Flag Category",
+    subtitle = "Higher flag categories show progressively higher default rates",
+    x        = "Risk Category",
+    y        = "Default Rate (%)",
+    caption  = "Source: Yeh & Lien (2009) | UCI ML Repository"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position    = "none",
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40", size = 10),
+    panel.grid.major.x = element_blank()
+  )
+```
+```{r flag-validation-note}
+
+# ── Observation on Flag Ordering ──────────────────────────────────────────────
+#
+# The default rate progression shows an important finding:
+# Watch (18.4%) is slightly higher than Early Flag (14.8%).
+#
+# This is not a data error. It reveals that the Watch category captures
+# customers with a single but powerful stress signal — particularly
+# very low repayment ratio — which is individually a strong default predictor.
+#
+# Early Flag captures customers with two signals firing together, but
+# those combinations can be less predictive than one severe signal alone.
+#
+# This is a known limitation of equal-weight scoring and would be addressed
+# in a production system by using model coefficients (logistic regression)
+# to weight each signal by its actual predictive strength rather than
+# treating all signals equally.
+#
+# The High Risk vs Stable comparison (42.3% vs 12.3%) confirms the flag
+# system successfully separates the most at-risk customers from the safest.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Key validation finding:\n")
+cat("High Risk default rate:  42.3%\n")
+cat("Stable default rate:     12.3%\n")
+cat("Difference:             ", 42.3 - 12.3, "percentage points\n")
+cat("High Risk defaults at", round(42.3 / 12.3, 1),
+    "times the rate of Stable customers\n\n")
+cat("Note: Watch > Early Flag ordering addressed in report discussion.\n")
+```
+
+```{r model-prep}
+
+# ── Preparing Data for Model Training ────────────────────────────────────────
+#
+# Before training any model we need to make three decisions:
+#
+# 1. Which columns to use as predictors
+#    We use the original UCI features plus our five engineered features.
+#    We exclude DEBT_FLAG because it is derived from the engineered
+#    features — using it as a predictor would be circular reasoning.
+#    We exclude STRESS_SCORE for the same reason.
+#
+# 2. How to split the data
+#    We use a 70/30 train/test split. The model learns on 70% and we
+#    evaluate how well it generalises on the held-out 30% it never saw.
+#
+# 3. How to handle class imbalance
+#    The dataset has 78% No Default and 22% Default.
+#    We tell the model to pay more attention to the minority class
+#    by using class weights. This prevents the model from simply
+#    predicting No Default for everyone and calling it 78% accurate.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Select only the columns we want for modelling
+# Remove DEBT_FLAG — it is our business output, not a predictor
+model_data <- uci_features %>%
+  select(
+    LIMIT_BAL, SEX, EDUCATION, MARRIAGE, AGE,
+    PAY_0, PAY_2, PAY_3, PAY_4, PAY_5, PAY_6,
+    BILL_AMT1, BILL_AMT2, BILL_AMT3,
+    BILL_AMT4, BILL_AMT5, BILL_AMT6,
+    PAY_AMT1, PAY_AMT2, PAY_AMT3,
+    PAY_AMT4, PAY_AMT5, PAY_AMT6,
+    UTIL_RATE, REPAY_RATIO, MIN_PAY_FREQ,
+    BAL_PERSIST, PAY_DELAY_COUNT,
+    DEFAULT
+  )
+
+cat("Model dataset dimensions:\n")
+cat("Rows:", nrow(model_data), "\n")
+cat("Columns:", ncol(model_data), "\n")
+cat("Predictors:", ncol(model_data) - 1, "\n")
+cat("Target: DEFAULT\n\n")
+
+
+# Set a random seed so results are reproducible
+# Anyone running this code will get the same split
+set.seed(42)
+
+# Create the 70/30 train/test split
+# createDataPartition ensures the class balance is preserved in both sets
+train_index <- createDataPartition(
+  model_data$DEFAULT,
+  p    = 0.70,
+  list = FALSE
+)
+
+train_data <- model_data[ train_index, ]
+test_data  <- model_data[-train_index, ]
+
+cat("Training set size:", nrow(train_data), "rows\n")
+cat("Test set size:    ", nrow(test_data),  "rows\n\n")
+
+# Confirm class balance is preserved in both sets
+cat("Class balance in training set:\n")
+print(round(prop.table(table(train_data$DEFAULT)) * 100, 1))
+
+cat("\nClass balance in test set:\n")
+print(round(prop.table(table(test_data$DEFAULT)) * 100, 1))
+```
+
+```{r train-control}
+
+# ── Setting Up Training Controls ─────────────────────────────────────────────
+#
+# Before training any model we define how the training process works.
+# This is the same control object used for all three models so the
+# comparison between them is fair — same folds, same class weights.
+#
+# Two important settings:
+#
+# 1. Cross-validation with 5 folds
+#    Instead of training on all 70% at once, we split the training set
+#    into 5 parts. The model trains on 4 parts and validates on the 5th,
+#    rotating through all five combinations. This gives a more reliable
+#    estimate of performance than a single split.
+#
+# 2. Class weights to handle imbalance
+#    We give the minority class (Default) roughly 3.5 times more weight
+#    than the majority class (No Default). This reflects the 78/22 split
+#    and stops the model from ignoring the Default class entirely.
+#    The weight ratio is calculated from the actual class counts.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Calculate class weights from the training data
+no_default_count <- sum(train_data$DEFAULT == "No Default")
+default_count    <- sum(train_data$DEFAULT == "Default")
+
+weight_ratio <- round(no_default_count / default_count, 2)
+
+cat("No Default count in training set:", no_default_count, "\n")
+cat("Default count in training set:   ", default_count, "\n")
+cat("Weight ratio applied to Default: ", weight_ratio, "\n\n")
+
+# Build the model weights vector
+# Each row in the training data gets a weight based on its class
+model_weights <- ifelse(
+  train_data$DEFAULT == "Default",
+  weight_ratio,
+  1.0
+)
+
+cat("Weight for Default rows:    ", weight_ratio, "\n")
+cat("Weight for No Default rows: ", 1.0, "\n\n")
+
+
+# Set up the cross-validation control
+# This is shared across all three models for a fair comparison
+train_control <- trainControl(
+  method          = "cv",
+  number          = 5,
+  classProbs      = TRUE,
+  summaryFunction = twoClassSummary,
+  savePredictions = "final"
+)
+
+cat("Training control configured:\n")
+cat("Method: 5-fold cross-validation\n")
+cat("Class probabilities: enabled\n")
+cat("Summary function: ROC / Sensitivity / Specificity\n")
+```
+
+```{r fix-factor-levels}
+
+# The DEFAULT column has levels "No Default" and "Default"
+# The space in "No Default" is not a valid R variable name
+# caret's twoClassSummary requires valid R variable names
+# We rename "No Default" to "No_Default" to fix this
+
+train_data <- train_data %>%
+  mutate(DEFAULT = recode_factor(DEFAULT,
+                                  "No Default" = "No_Default",
+                                  "Default"    = "Default"))
+
+test_data <- test_data %>%
+  mutate(DEFAULT = recode_factor(DEFAULT,
+                                  "No Default" = "No_Default",
+                                  "Default"    = "Default"))
+
+# Rebuild model weights with the corrected level name
+model_weights <- ifelse(
+  train_data$DEFAULT == "Default",
+  weight_ratio,
+  1.0
+)
+
+cat("Factor levels fixed.\n")
+cat("Training set levels:", levels(train_data$DEFAULT), "\n")
+cat("Test set levels:    ", levels(test_data$DEFAULT), "\n")
+```
+```{r logistic-regression}
+
+# ── Model 1: Logistic Regression ─────────────────────────────────────────────
+#
+# Logistic regression is our baseline model — the simplest approach.
+# It estimates the probability that a customer will default based on
+# a weighted combination of the input features.
+#
+# We use it first because:
+# - It is easy to interpret — each feature gets a coefficient that shows
+#   how much it pushes the probability up or down
+# - It trains fast — good for checking that everything is working
+# - It is the academic baseline for credit risk models
+# - It was covered in Week 7 of FIT5145
+#
+# We use the glm method (Generalised Linear Model) with binomial family
+# which is the standard implementation of logistic regression in R.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Training Logistic Regression — please wait...\n\n")
+
+set.seed(42)
+
+model_lr <- train(
+  DEFAULT ~ .,
+  data     = train_data,
+  method   = "glm",
+  family   = "binomial",
+  trControl = train_control,
+  weights  = model_weights,
+  metric   = "ROC"
+)
+
+cat("Logistic Regression training complete.\n\n")
+
+# Make predictions on the test set
+pred_lr       <- predict(model_lr, newdata = test_data)
+pred_lr_prob  <- predict(model_lr, newdata = test_data, type = "prob")
+
+# Build confusion matrix
+cm_lr <- confusionMatrix(
+  data      = pred_lr,
+  reference = test_data$DEFAULT,
+  positive  = "Default"
+)
+
+# Print results
+cat("=== LOGISTIC REGRESSION RESULTS ===\n\n")
+cat("Confusion Matrix:\n")
+print(cm_lr$table)
+
+cat("\nKey Metrics:\n")
+cat("Accuracy: ", round(cm_lr$overall["Accuracy"] * 100, 1), "%\n")
+cat("Precision:", round(cm_lr$byClass["Precision"] * 100, 1), "%\n")
+cat("Recall:   ", round(cm_lr$byClass["Recall"] * 100, 1), "%\n")
+cat("F1 Score: ", round(cm_lr$byClass["F1"] * 100, 1), "%\n")
+
+# Calculate AUC
+roc_lr  <- roc(
+  response  = test_data$DEFAULT,
+  predictor = pred_lr_prob[, "Default"],
+  levels    = c("No_Default", "Default")
+)
+
+cat("AUC:      ", round(auc(roc_lr), 3), "\n")
+```
+
+```{r roc-curve}
+
+# ── ROC Curve ─────────────────────────────────────────────────────────────────
+#
+# The ROC curve is the standard academic visualisation for binary classifiers.
+# It plots the True Positive Rate against the False Positive Rate at every
+# possible decision threshold. The area under the curve (AUC) summaries
+# the model's overall discriminate ability in one number.
+#
+# A perfect model would hug the top-left corner (AUC = 1.0).
+# A random model would follow the diagonal line (AUC = 0.5).
+# Our model at 0.766 sits meaningfully above random.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Extract ROC curve coordinates for plotting
+roc_df <- data.frame(
+  FPR       = 1 - roc_lr$specificities,
+  TPR       = roc_lr$sensitivities
+)
+
+auc_value <- round(auc(roc_lr), 3)
+
+ggplot(roc_df, aes(x = FPR, y = TPR)) +
+
+  # The diagonal reference line — this is what a random model looks like
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", colour = "grey60", linewidth = 0.7) +
+
+  # The actual ROC curve
+  geom_line(colour = "#2471A3", linewidth = 1.2) +
+
+  # Shade the area under the curve
+  geom_area(fill = "#2471A3", alpha = 0.12) +
+
+  # Annotate the AUC value directly on the chart
+  annotate("text",
+           x     = 0.65,
+           y     = 0.25,
+           label = paste0("AUC = ", auc_value),
+           size  = 5,
+           fontface = "bold",
+           colour   = "#2471A3") +
+
+  # Annotate the random baseline
+  annotate("text",
+           x     = 0.72,
+           y     = 0.62,
+           label = "Random classifier\n(AUC = 0.5)",
+           size  = 3.5,
+           colour = "grey50",
+           angle  = 38) +
+
+  scale_x_continuous(labels = percent_format(), limits = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(), limits = c(0, 1)) +
+
+  labs(
+    title    = "ROC Curve — Logistic Regression",
+    subtitle = "Receiver Operating Characteristic | Default prediction on UCI credit card data",
+    x        = "False Positive Rate (1 - Specificity)",
+    y        = "True Positive Rate (Sensitivity / Recall)",
+    caption  = "Source: Yeh & Lien (2009) | UCI ML Repository"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey40", size = 10),
+    panel.grid.minor = element_blank()
+  )
+```
+
+```{r confusion-matrix-heatmap}
+
+# ── Confusion Matrix Heatmap ──────────────────────────────────────────────────
+#
+# A styled heatmap version of the confusion matrix.
+# The four cells tell the full story of model performance:
+#
+# True Negative  (top-left):  correctly predicted No Default
+# False Positive (top-right): predicted Default but was actually No Default
+# False Negative (bot-left):  predicted No Default but was actually Default
+# True Positive  (bot-right): correctly predicted Default
+#
+# For a debt stress system, False Negatives are the dangerous misses —
+# these are genuinely at-risk customers the model failed to flag.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Build a clean data frame from the confusion matrix
+cm_df <- as.data.frame(cm_lr$table) %>%
+  rename(Predicted = Prediction, Actual = Reference) %>%
+  mutate(
+    Label = case_when(
+      Predicted == "No_Default" & Actual == "No_Default" ~
+        paste0("True Negative\n", comma(Freq)),
+      Predicted == "Default"    & Actual == "No_Default" ~
+        paste0("False Positive\n", comma(Freq)),
+      Predicted == "No_Default" & Actual == "Default"    ~
+        paste0("False Negative\n", comma(Freq)),
+      Predicted == "Default"    & Actual == "Default"    ~
+        paste0("True Positive\n", comma(Freq))
+    ),
+    Fill_Value = Freq
+  )
+
+ggplot(cm_df, aes(x = Actual, y = Predicted, fill = Fill_Value)) +
+
+  geom_tile(colour = "white", linewidth = 2) +
+
+  geom_text(aes(label = Label),
+            size     = 4.5,
+            fontface = "bold",
+            colour   = "white") +
+
+  scale_fill_gradient(
+    low  = "#AED6F1",
+    high = "#1A5276"
+  ) +
+
+  scale_x_discrete(labels = c("No_Default" = "No Default",
+                                "Default"    = "Default")) +
+  scale_y_discrete(labels = c("No_Default" = "No Default",
+                                "Default"    = "Default")) +
+
+  labs(
+    title    = "Confusion Matrix — Logistic Regression",
+    subtitle = "Predictions vs actual outcomes on held-out test set (n = 8,989)",
+    x        = "Actual Class",
+    y        = "Predicted Class",
+    caption  = "Darker = higher count"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(colour = "grey40", size = 10),
+    legend.position  = "none",
+    panel.grid       = element_blank(),
+    axis.text        = element_text(size = 11)
+  )
+```
+
+
+```{r metrics-dashboard}
+
+# ── Performance Metrics Dashboard ────────────────────────────────────────────
+#
+# A clean horizontal bar chart showing all four evaluation metrics
+# side by side. This format is used in published ML papers because it
+# lets you compare metrics at a glance without scanning a table.
+#
+# We include a reference line at 50% to show what random guessing
+# would produce, and at 77.9% to show the naive baseline accuracy
+# (always predicting No Default).
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+metrics_lr <- data.frame(
+  Metric = c("Accuracy", "Precision", "Recall", "F1 Score", "AUC"),
+  Value  = c(
+    round(cm_lr$overall["Accuracy"] * 100, 1),
+    round(cm_lr$byClass["Precision"] * 100, 1),
+    round(cm_lr$byClass["Recall"] * 100, 1),
+    round(cm_lr$byClass["F1"] * 100, 1),
+    round(auc(roc_lr) * 100, 1)
+  )
+) %>%
+  mutate(Metric = factor(Metric,
+                          levels = c("AUC", "F1 Score", "Recall",
+                                     "Precision", "Accuracy")))
+
+ggplot(metrics_lr, aes(x = Value, y = Metric, fill = Metric)) +
+
+  # Naive baseline — always predict majority class
+  geom_vline(xintercept = 77.9,
+             linetype   = "dashed",
+             colour     = "grey60",
+             linewidth  = 0.8) +
+
+  # Random baseline
+  geom_vline(xintercept = 50,
+             linetype   = "dotted",
+             colour     = "grey80",
+             linewidth  = 0.8) +
+
+  geom_bar(stat    = "identity",
+           width   = 0.55,
+           colour  = "white") +
+
+  geom_text(aes(label = paste0(Value, "%")),
+            hjust    = -0.2,
+            size     = 4,
+            fontface = "bold") +
+
+  # Annotate the reference lines
+  annotate("text", x = 79, y = 0.5,
+           label  = "Naive\nbaseline\n77.9%",
+           size   = 3, colour = "grey50", hjust = 0) +
+
+  annotate("text", x = 51, y = 0.5,
+           label  = "Random\n50%",
+           size   = 3, colour = "grey70", hjust = 0) +
+
+  scale_fill_manual(values = c(
+    "Accuracy"  = "#2471A3",
+    "Precision" = "#1A9E6A",
+    "Recall"    = "#E67E22",
+    "F1 Score"  = "#8E44AD",
+    "AUC"       = "#C0392B"
+  )) +
+
+  scale_x_continuous(
+    limits = c(0, 100),
+    labels = function(x) paste0(x, "%")
+  ) +
+
+  labs(
+    title    = "Model Performance Dashboard — Logistic Regression",
+    subtitle = "All metrics evaluated on held-out test set (n = 8,989)",
+    x        = "Score (%)",
+    y        = NULL,
+    caption  = "Dashed line = naive baseline (always predict majority class)"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position  = "none",
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(colour = "grey40", size = 10),
+    panel.grid.minor = element_blank(),
+    axis.text.y      = element_text(size = 12)
+  )
+```
+
+
+```{r classification-tree}
+
+# ── Model 2: Classification Tree ─────────────────────────────────────────────
+#
+# A classification tree splits customers into groups by asking a series
+# of yes or no questions about their features. Each split tries to
+# separate defaulters from non-defaulters as cleanly as possible.
+#
+# We use it because:
+# - It produces a visual decision tree we can read and explain
+# - It shows exactly which features matter and at what thresholds
+# - It directly reflects the logic behind our Invisible Debt Trap Flag
+# - It was covered in Week 7 of FIT5145
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Training Classification Tree — please wait...\n\n")
+
+set.seed(42)
+
+model_tree <- train(
+  DEFAULT ~ .,
+  data       = train_data,
+  method     = "rpart",
+  trControl  = train_control,
+  weights    = model_weights,
+  metric     = "ROC",
+  tuneLength = 10
+)
+
+cat("Classification Tree training complete.\n\n")
+
+# Predictions on test set
+pred_tree      <- predict(model_tree, newdata = test_data)
+pred_tree_prob <- predict(model_tree, newdata = test_data, type = "prob")
+
+# Confusion matrix
+cm_tree <- confusionMatrix(
+  data      = pred_tree,
+  reference = test_data$DEFAULT,
+  positive  = "Default"
+)
+
+# AUC
+roc_tree <- roc(
+  response  = test_data$DEFAULT,
+  predictor = pred_tree_prob[, "Default"],
+  levels    = c("No_Default", "Default")
+)
+
+# Print all results
+cat("=== CLASSIFICATION TREE RESULTS ===\n\n")
+cat("Confusion Matrix:\n")
+print(cm_tree$table)
+
+cat("\nKey Metrics:\n")
+cat("Accuracy: ", round(cm_tree$overall["Accuracy"] * 100, 1), "%\n")
+cat("Precision:", round(cm_tree$byClass["Precision"] * 100, 1), "%\n")
+cat("Recall:   ", round(cm_tree$byClass["Recall"] * 100, 1), "%\n")
+cat("F1 Score: ", round(cm_tree$byClass["F1"] * 100, 1), "%\n")
+cat("AUC:      ", round(auc(roc_tree), 3), "\n")
+```
+```{r tree-visualisation}
+
+# ── Visualising the Decision Tree ────────────────────────────────────────────
+#
+# This is one of the most powerful features of a classification tree —
+# we can actually see the decisions it makes and trace the path for
+# any customer.
+#
+# Each node shows:
+# - The splitting condition (e.g. PAY_DELAY_COUNT >= 2)
+# - The probability of Default in that branch
+# - The percentage of customers reaching that node
+#
+# This directly connects to our Invisible Debt Trap Flag logic —
+# the tree independently discovers that payment delays and repayment
+# behaviour are the most important splitting features.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+rpart.plot(
+  model_tree$finalModel,
+  type     = 4,
+  extra    = 104,
+  box.palette = c("#27AE60", "#F39C12", "#E67E22", "#C0392B"),
+  shadow.col  = "grey80",
+  nn          = TRUE,
+  fallen.leaves = TRUE,
+  main        = "Classification Tree — Default Prediction\nUCI Credit Card Dataset"
+)
+```
+
+```{r random-forest}
+
+# ── Model 3: Random Forest ────────────────────────────────────────────────────
+#
+# A random forest builds many decision trees — each trained on a random
+# sample of the data and a random subset of features — then combines
+# their predictions by majority vote.
+#
+# This fixes the main weakness of a single tree:
+# - A single tree tends to overfit — it memorises the training data
+#   rather than learning the general pattern
+# - By averaging hundreds of trees built on different samples,
+#   the random forest cancels out individual errors
+#
+# This is the ensemble method covered in Week 8 of FIT5145.
+# We expect it to outperform both logistic regression and the single tree.
+#
+# Note: Random Forest takes longer to train — typically 3 to 5 minutes.
+# This is normal. Do not close RStudio while it runs.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Training Random Forest — this will take 3 to 5 minutes...\n\n")
+
+set.seed(42)
+
+model_rf <- train(
+  DEFAULT ~ .,
+  data      = train_data,
+  method    = "rf",
+  trControl = train_control,
+  weights   = model_weights,
+  metric    = "ROC",
+  tuneLength = 3,
+  ntree      = 200
+)
+
+cat("Random Forest training complete.\n\n")
+
+# Predictions on test set
+pred_rf      <- predict(model_rf, newdata = test_data)
+pred_rf_prob <- predict(model_rf, newdata = test_data, type = "prob")
+
+# Confusion matrix
+cm_rf <- confusionMatrix(
+  data      = pred_rf,
+  reference = test_data$DEFAULT,
+  positive  = "Default"
+)
+
+# AUC
+roc_rf <- roc(
+  response  = test_data$DEFAULT,
+  predictor = pred_rf_prob[, "Default"],
+  levels    = c("No_Default", "Default")
+)
+
+# Print all results
+cat("=== RANDOM FOREST RESULTS ===\n\n")
+cat("Confusion Matrix:\n")
+print(cm_rf$table)
+
+cat("\nKey Metrics:\n")
+cat("Accuracy: ", round(cm_rf$overall["Accuracy"] * 100, 1), "%\n")
+cat("Precision:", round(cm_rf$byClass["Precision"] * 100, 1), "%\n")
+cat("Recall:   ", round(cm_rf$byClass["Recall"] * 100, 1), "%\n")
+cat("F1 Score: ", round(cm_rf$byClass["F1"] * 100, 1), "%\n")
+cat("AUC:      ", round(auc(roc_rf), 3), "\n")
+```
+
+```{r model-comparison-note}
+
+# ──Explanation on  Recall Matters Most For This Project ─────────────────────────────────
+#
+# For a consumer debt stress early warning system, missing a genuinely
+# at-risk customer (False Negative) is more harmful than incorrectly
+# flagging a safe customer (False Positive).
+#
+# A False Negative means a customer in real debt stress receives no warning
+# and continues without intervention until the situation worsens.
+# A False Positive means a safe customer receives an unnecessary alert
+# — they can simply dismiss it.
+#
+# This asymmetry of costs means Recall should be our primary evaluation
+# metric, not accuracy. By this measure, the Classification Tree performs
+# best at 63% recall, followed by Logistic Regression at 60%.
+#
+# Random Forest achieves higher accuracy (81.6%) but only catches 38%
+# of actual defaulters — making it the least suitable model for our purpose
+# despite appearing strongest on the accuracy metric.
+#
+# This finding will be discussed in the report's Demonstration section.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Model comparison — Recall focused:\n\n")
+cat("Classification Tree: 63.0% recall — recommended for this project\n")
+cat("Logistic Regression: 60.0% recall — strong interpretable baseline\n")
+cat("Random Forest:       38.0% recall — highest accuracy but misses\n")
+cat("                                     most actual defaulters\n\n")
+cat("For a debt stress early warning system, recall is the priority metric.\n")
+cat("Missing a real case is worse than a false alarm.\n")
+```
+
+
+```{r model-comparison-chart}
+
+# ── Three Model Comparison Chart - ─────────────────────────────────────────────
+#
+# This chart puts all three models side by side across all five metrics.
+# It is the standard way to present model comparison results in
+# published data science research papers.
+#
+# The chart makes it immediately clear that:
+# - Random Forest wins on Accuracy and Precision
+# - Classification Tree wins on Recall — most important for our project
+# - All three models have similar AUC
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+comparison_data <- data.frame(
+  Model = rep(c("Logistic\nRegression",
+                "Classification\nTree",
+                "Random\nForest"), each = 5),
+  Metric = rep(c("Accuracy", "Precision", "Recall",
+                  "F1 Score", "AUC"), times = 3),
+  Value = c(
+    # Logistic Regression
+    76.6, 47.6, 60.0, 53.1, 76.6,
+    # Classification Tree
+    76.1, 47.0, 63.0, 53.9, 76.1,
+    # Random Forest
+    81.6, 64.5, 38.0, 47.8, 76.6
+  )
+) %>%
+  mutate(
+    Model  = factor(Model,
+                    levels = c("Logistic\nRegression",
+                               "Classification\nTree",
+                               "Random\nForest")),
+    Metric = factor(Metric,
+                    levels = c("Accuracy", "Precision",
+                               "Recall", "F1 Score", "AUC"))
+  )
+
+model_colours <- c(
+  "Logistic\nRegression"  = "#2471A3",
+  "Classification\nTree"  = "#1A9E6A",
+  "Random\nForest"        = "#C0392B"
+)
+
+ggplot(comparison_data,
+       aes(x = Metric, y = Value, fill = Model)) +
+
+  geom_bar(stat     = "identity",
+           position = position_dodge(width = 0.75),
+           width    = 0.65,
+           colour   = "white") +
+
+  geom_text(
+    aes(label = paste0(Value, "%")),
+    position = position_dodge(width = 0.75),
+    vjust    = -0.4,
+    size     = 3.2,
+    fontface = "bold"
+  ) +
+
+  # Highlight the Recall bar with a bracket to show it is the priority
+  annotate("rect",
+           xmin  = 2.5, xmax = 3.5,
+           ymin  = 0,   ymax = 72,
+           alpha = 0.06,
+           fill  = "#F39C12") +
+
+  annotate("text",
+           x     = 3,
+           y     = 68,
+           label = "Priority metric\nfor this project",
+           size  = 3.2,
+           colour = "#E67E22",
+           fontface = "italic") +
+
+  scale_fill_manual(values = model_colours) +
+  scale_y_continuous(
+    limits = c(0, 95),
+    labels = function(x) paste0(x, "%")
+  ) +
+
+  labs(
+    title    = "Model Performance Comparison — All Three Models",
+    subtitle = "Classification Tree shows highest Recall — most important for debt stress detection",
+    x        = NULL,
+    y        = "Score (%)",
+    fill     = "Model",
+    caption  = "Shaded area highlights priority metric for this project"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title       = element_text(face = "bold"),
+    plot.subtitle    = element_text(colour = "grey40", size = 10),
+    legend.position  = "bottom",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+```{r load-rba-c1}
+
+# ── Loading RBA C1 Credit Card Data-- ──────────────────────────────────────────
+#
+# The RBA file has 11 header rows before the actual data begins.
+# We skip those and load from row 12 onwards.
+#
+# Step 1: Read column names from row 2 separately
+# Step 2: Read data starting from row 12
+# Step 3: Assign column names and convert dates
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Step 1 — Get column names from row 2 of the file
+rba_headers <- read_excel(
+  "dataset/c01hist(RBA_1).xlsx",
+  skip      = 1,
+  n_max     = 1,
+  col_names = FALSE
+)
+
+col_names_vec <- as.character(rba_headers[1, ])
+cat("Number of columns found:", length(col_names_vec), "\n\n")
+
+
+# Step 2 — Load the actual data starting at row 12
+rba_raw <- read_excel(
+  "dataset/c01hist(RBA_1).xlsx",
+  skip      = 11,
+  col_names = FALSE
+)
+
+cat("Rows loaded:", nrow(rba_raw), "\n")
+cat("Columns loaded:", ncol(rba_raw), "\n\n")
+
+
+# Step 3 — Assign column names
+# The number of header columns and data columns must match
+# If they differ we use the data column count
+if (length(col_names_vec) == ncol(rba_raw)) {
+  names(rba_raw) <- col_names_vec
+} else {
+  names(rba_raw)[1] <- "Date"
+  cat("Note: column count mismatch — date column named manually\n")
+}
+
+
+# Step 4 — Show all column names so we can find the ones we need
+cat("All column names in RBA C1 file:\n")
+for (i in seq_along(names(rba_raw))) {
+  cat(i, ":", names(rba_raw)[i], "\n")
+}
+```
+
+```{r process-rba-c1}
+  
+
+# ── Step 1: Select Relevant Columns
+
+# ──────────────────────────────────────────
+
+# ----Complete Data Cleaning--------------- 
+
+rba_selected <- rba_raw %>%
+  select(
+    Date_Raw          = `Title`,
+    Balances_Interest = `Balances accruing interest`,
+    Total_Balances    = `Total balances`,
+    Repayments        = `Repayments`,
+    Personal_Balances = `Total balances: personal cards`
+  )
+
+cat("Columns selected:", ncol(rba_selected), "\n")
+cat("Rows before cleaning:", nrow(rba_selected), "\n\n")
+
+
+# ── Step 2: Standardise Column Names ─────────────────────────────────────────
+#
+# Original column names have spaces, mixed case, and colons.
+# We standardise to lowercase with underscores — consistent with
+# the UCI dataset column naming convention we used earlier.
+
+rba_selected <- rba_selected %>%
+  rename_with(~ tolower(gsub(" ", "_", gsub(":", "", .x))))
+
+cat("Standardised column names:\n")
+print(names(rba_selected))
+cat("\n")
+
+
+# ── Step 3: Convert Date Column-- ───────────────────────────────────────────────
+#
+# The date column contains Excel serial numbers.
+# Excel dates start from 1899-12-30 due to a known Excel quirk.
+# We convert to proper R Date objects.
+
+rows_before_date_filter <- nrow(rba_selected)
+
+rba_selected <- rba_selected %>%
+  mutate(
+    date = as.Date(as.numeric(date_raw), origin = "1899-12-30")
+  ) %>%
+  filter(!is.na(date)) %>%
+  select(-date_raw)
+
+rows_removed_date <- rows_before_date_filter - nrow(rba_selected)
+cat("Rows removed due to invalid dates:", rows_removed_date, "\n")
+cat("Date range after conversion:", format(min(rba_selected$date)),
+    "to", format(max(rba_selected$date)), "\n\n")
+
+
+# ── Step 4: Convert Balance Columns to Numeric ───────────────────────────────
+
+rba_selected <- rba_selected %>%
+  mutate(
+    balances_interest = as.numeric(balances_interest),
+    total_balances    = as.numeric(total_balances),
+    repayments        = as.numeric(repayments),
+    personal_balances = as.numeric(personal_balances)
+  )
+
+
+# ── Step 5: Missing Value Audit-- ───────────────────────────────────────────────
+#
+# Explicitly count missing values in each column before removing them.
+
+cat("Missing value audit:\n")
+missing_check <- colSums(is.na(rba_selected))
+print(missing_check)
+cat("\n")
+
+rows_before_na <- nrow(rba_selected)
+
+rba_selected <- rba_selected %>%
+  filter(!is.na(balances_interest), !is.na(total_balances))
+
+rows_removed_na <- rows_before_na - nrow(rba_selected)
+cat("Rows removed due to missing balance values:", rows_removed_na, "\n\n")
+
+
+# ── Step 6: Check for Negative Values ────────────────────────────────────────
+#
+# Credit card balances and repayments should never be negative.
+# A negative balance would mean the bank owes the customer money at
+# aggregate level — impossible in Australian credit card market data.
+
+cat("Negative value check:\n")
+cat("Negative balances_interest:", sum(rba_selected$balances_interest < 0,
+                                       na.rm = TRUE), "\n")
+cat("Negative total_balances:   ", sum(rba_selected$total_balances < 0,
+                                       na.rm = TRUE), "\n")
+cat("Negative repayments:       ", sum(rba_selected$repayments < 0,
+                                       na.rm = TRUE), "\n\n")
+
+
+# ── Step 7: Check for Zero Values ────────────────────────────────────────────
+#
+# A total balance of exactly zero for an entire month is suspicious —
+# it would mean no Australian held a credit card balance that month.
+
+cat("Zero value check:\n")
+cat("Months with zero total_balances:", sum(rba_selected$total_balances == 0,
+                                             na.rm = TRUE), "\n\n")
+
+
+# ── Step 8: Check for Duplicate Dates--- #────────────────────────────────────────
+
+dup_dates <- sum(duplicated(rba_selected$date))
+cat("Duplicate dates found:", dup_dates, "\n\n")
+
+
+# ── Step 9: Check for Impossible Revolving Ratios
+# ────────────────────────────
+# Balances accruing interest cannot exceed total balances.
+# A ratio above 100% or below 0% indicates a data error.
+
+rba_selected <- rba_selected %>%
+  mutate(
+    revolving_ratio = round(balances_interest / total_balances * 100, 1)
+  )
+
+cat("Revolving ratio range check:\n")
+cat("Minimum ratio:", min(rba_selected$revolving_ratio, na.rm = TRUE), "%\n")
+cat("Maximum ratio:", max(rba_selected$revolving_ratio, na.rm = TRUE), "%\n")
+cat("Rows above 100%:", sum(rba_selected$revolving_ratio > 100,
+                             na.rm = TRUE), "\n")
+cat("Rows below 0%:  ", sum(rba_selected$revolving_ratio < 0,
+                             na.rm = TRUE), "\n\n")
+
+
+# ── Step 10: Check Time Series Continuity ────────────────────────────────────
+#
+# Monthly data should have no gaps. If dates jump by more than
+# one month, there is a gap in the time series.
+
+date_diffs <- as.numeric(diff(rba_selected$date))
+gaps <- sum(date_diffs > 35)
+cat("Gaps in monthly time series (jumps > 35 days):", gaps, "\n\n")
+
+
+# ── Step 11: Filter to 2015 Onwards #──────────────────────────────────────────
+
+rba_clean <- rba_selected %>%
+  filter(date >= as.Date("2015-01-01")) %>%
+  arrange(date)
+
+cat("─────────────────────────────────────────────\n")
+cat("RBA C1 clean dataset ready.\n")
+cat("Date range:", format(min(rba_clean$date)), "to",
+    format(max(rba_clean$date)), "\n")
+cat("Total months:", nrow(rba_clean), "\n")
+cat("Missing values remaining:", sum(is.na(rba_clean)), "\n")
+cat("─────────────────────────────────────────────\n")
+
+```
+
+
+```{r fix-rba-dates}
+
+# ── Diagnosing the Date Column ────────────────────────────────────────────────
+#
+# First we check what class read_excel actually gave us for the date column.
+# If it is already a Date or POSIXct, we should not apply numeric conversion.
+# If it is numeric, we apply the Excel origin conversion.
+# If it is character, we need a different approach.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+cat("Class of date_raw column:", class(rba_raw[[1]]), "\n")
+cat("First 5 values in date column:\n")
+print(head(rba_raw[[1]], 5))
+cat("\n")
+
+# Fix: convert based on actual class
+rba_selected <- rba_raw %>%
+  select(
+    date_raw          = 1,
+    balances_interest = `Balances accruing interest`,
+    total_balances    = `Total balances`,
+    repayments        = `Repayments`,
+    personal_balances = `Total balances: personal cards`
+  ) %>%
+  mutate(
+    # Handle all three possible cases for the date column
+    date = case_when(
+      # Already a Date or POSIXct — just convert directly
+      inherits(date_raw, "POSIXct") | inherits(date_raw, "Date") ~
+        as.Date(date_raw),
+      # Numeric — Excel serial number conversion
+      is.numeric(date_raw) ~
+        as.Date(as.numeric(date_raw), origin = "1899-12-30"),
+      # Character — try parsing as date string
+      TRUE ~
+        as.Date(as.character(date_raw))
+    )
+  ) %>%
+  filter(!is.na(date)) %>%
+  select(-date_raw)
+
+cat("Date conversion result:\n")
+cat("First 5 dates:\n")
+print(head(rba_selected$date, 5))
+cat("\nLast 5 dates:\n")
+print(tail(rba_selected$date, 5))
+cat("\nDate range:", format(min(rba_selected$date)),
+    "to", format(max(rba_selected$date)), "\n")
+```
+
+```{r rba-clean-complete}
+
+# ── Complete the RBA Data Cleaning- ───────────────────────────────────────────
+#
+# Now that dates are correct we finish cleaning:
+# - Convert balance columns to numeric
+# - Run the full missing value audit
+# - Check for negative and impossible values
+# - Check for duplicate dates
+# - Filter to 2015 onwards for our analysis window
+# - Derive the revolving ratio
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Convert all balance columns to numeric
+rba_selected <- rba_selected %>%
+  mutate(
+    balances_interest = as.numeric(balances_interest),
+    total_balances    = as.numeric(total_balances),
+    repayments        = as.numeric(repayments),
+    personal_balances = as.numeric(personal_balances)
+  )
+
+
+# ── Missing value audit ───────────────────────────────────────────────────────
+
+cat("Missing value audit before filtering:\n")
+print(colSums(is.na(rba_selected)))
+cat("\n")
+
+rows_before_na <- nrow(rba_selected)
+
+rba_selected <- rba_selected %>%
+  filter(!is.na(balances_interest), !is.na(total_balances))
+
+rows_removed <- rows_before_na - nrow(rba_selected)
+cat("Rows removed due to missing balance values:", rows_removed, "\n")
+cat("Rows remaining:", nrow(rba_selected), "\n\n")
+
+
+# ── Negative value check ──────────────────────────────────────────────────────
+
+cat("Negative value check:\n")
+cat("Negative balances_interest:", sum(rba_selected$balances_interest < 0), "\n")
+cat("Negative total_balances:   ", sum(rba_selected$total_balances < 0),    "\n")
+cat("Negative repayments:       ", sum(rba_selected$repayments < 0, na.rm = TRUE), "\n\n")
+
+
+# ── Duplicate date check ──────────────────────────────────────────────────────
+
+dup_dates <- sum(duplicated(rba_selected$date))
+cat("Duplicate dates found:", dup_dates, "\n\n")
+
+
+# ── Derive revolving ratio ────────────────────────────────────────────────────
+#
+# Revolving ratio = balances accruing interest / total balances
+# This is our key Australian context metric.
+# It shows what share of all Australian credit card debt is currently
+# rolling over with interest — the core indicator of debt trap behaviour.
+
+rba_selected <- rba_selected %>%
+  mutate(
+    revolving_ratio = round(balances_interest / total_balances * 100, 1)
+  )
+
+cat("Revolving ratio range check:\n")
+cat("Minimum:", min(rba_selected$revolving_ratio), "%\n")
+cat("Maximum:", max(rba_selected$revolving_ratio), "%\n")
+cat("Any above 100%:", sum(rba_selected$revolving_ratio > 100), "\n")
+cat("Any below 0%:  ", sum(rba_selected$revolving_ratio < 0),   "\n\n")
+
+
+# ── Filter to 2015 onwards ───────────────────────────────────────────────────
+
+rba_clean <- rba_selected %>%
+  filter(date >= as.Date("2015-01-01")) %>%
+  arrange(date)
+
+
+# ── Final summary ─────────────────────────────────────────────────────────────
+
+cat("─────────────────────────────────────────────\n")
+cat("RBA C1 clean dataset ready.\n\n")
+cat("Date range:", format(min(rba_clean$date)),
+    "to", format(max(rba_clean$date)), "\n")
+cat("Total months:", nrow(rba_clean), "\n")
+cat("Missing values remaining:", sum(is.na(rba_clean)), "\n\n")
+
+cat("Revolving ratio — key findings:\n")
+cat("Latest value:  ",
+    rba_clean$revolving_ratio[nrow(rba_clean)], "%  on",
+    format(max(rba_clean$date)), "\n")
+cat("Highest since 2015:",
+    max(rba_clean$revolving_ratio), "% on",
+    format(rba_clean$date[which.max(rba_clean$revolving_ratio)]), "\n")
+cat("Lowest since 2015: ",
+    min(rba_clean$revolving_ratio), "% on",
+    format(rba_clean$date[which.min(rba_clean$revolving_ratio)]), "\n")
+cat("─────────────────────────────────────────────\n")
+```
+
+
+```{r rba-events-chart}
+
+# ── Australian Revolving Ratio With Economic Event Annotations ────────────────
+#
+# This chart tells the story of WHY the revolving ratio moved the way it did.
+# Each annotated event directly influenced Australian household finances
+# and credit card repayment behaviour.
+#
+# 1. COVID-19 (Mar 2020): Government stimulus gave households extra cash.
+#    Many used it to pay down credit card debt. Revolving ratio fell.
+#
+# 2. Ukraine War / Global Inflation (Feb 2022): Energy and food prices
+#    spiked globally. Australians used credit cards for daily expenses.
+#
+# 3. RBA Rate Hikes Begin (May 2022): RBA raised cash rate 13 times from
+#    0.1% to 4.35% — fastest rate-rise cycle in Australian history.
+#
+# 4. Red Sea Crisis (Dec 2023): Iran-backed Houthi forces attacked Red Sea
+#    shipping lanes. Shipping costs spiked 300%. Australian import prices
+#    rose, adding further cost-of-living pressure on households.
+#
+# 5. RBA Rate Cuts Begin (Feb 2025): RBA began cutting rates.
+#    Some mortgage relief but credit card stress remains elevated.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+rba_plot <- rba_clean %>%
+  mutate(total_balances_bn = total_balances / 1000)
+
+events <- data.frame(
+  date   = as.Date(c("2020-03-01", "2022-02-24",
+                      "2022-05-01", "2023-12-01", "2025-02-01")),
+  label  = c("COVID-19\nStimulus",
+              "Ukraine War\nGlobal Inflation",
+              "RBA Rate\nHikes Begin",
+              "Red Sea\nCrisis",
+              "RBA Rate\nCuts Begin"),
+  y_pos  = c(62, 56, 59, 49, 52),
+  colour = c("#2471A3", "#8E44AD", "#E74C3C", "#D35400", "#27AE60")
+)
+
+latest_point <- rba_plot %>% slice_tail(n = 1)
+
+covid_low <- rba_plot %>%
+  filter(date >= as.Date("2021-01-01"),
+         date <= as.Date("2021-12-31")) %>%
+  filter(revolving_ratio == min(revolving_ratio))
+
+p <- ggplot(rba_plot, aes(x = date)) +
+
+  annotate("rect",
+           xmin  = as.Date("2022-05-01"),
+           xmax  = as.Date("2023-11-01"),
+           ymin  = -Inf,
+           ymax  = Inf,
+           alpha = 0.05,
+           fill  = "#E74C3C") +
+
+  annotate("rect",
+           xmin  = as.Date("2025-02-01"),
+           xmax  = as.Date("2026-03-31"),
+           ymin  = -Inf,
+           ymax  = Inf,
+           alpha = 0.05,
+           fill  = "#27AE60") +
+
+  geom_line(aes(y = revolving_ratio),
+            colour    = "#2C3E50",
+            linewidth = 1.1) +
+
+  geom_smooth(aes(y = revolving_ratio),
+              method    = "loess",
+              span      = 0.25,
+              colour    = "#E74C3C",
+              se        = FALSE,
+              linewidth = 1.4) +
+
+  geom_vline(data      = events,
+             aes(xintercept = date,
+                 colour     = colour),
+             linetype  = "dashed",
+             linewidth = 0.7,
+             alpha     = 0.8) +
+
+  geom_label(data = events,
+             aes(x      = date,
+                 y      = y_pos,
+                 label  = label,
+                 colour = colour),
+             fill          = "white",
+             size          = 2.8,
+             fontface      = "bold",
+             label.padding = unit(0.2, "lines"),
+             label.size    = 0.3) +
+
+  geom_point(data   = latest_point,
+             aes(y  = revolving_ratio),
+             colour = "#C0392B",
+             size   = 4) +
+
+  geom_label(data      = latest_point,
+             aes(y     = revolving_ratio,
+                 label = paste0("Latest\n", revolving_ratio, "%")),
+             nudge_x   = -200,
+             nudge_y   = 3.5,
+             size      = 3,
+             colour    = "#C0392B",
+             fill      = "white",
+             fontface  = "bold") +
+
+  geom_point(data   = covid_low,
+             aes(y  = revolving_ratio),
+             colour = "#2471A3",
+             size   = 4) +
+
+  scale_colour_identity() +
+
+  scale_x_date(date_breaks  = "1 year",
+               date_labels  = "%Y",
+               expand       = c(0.02, 0)) +
+
+  scale_y_continuous(limits = c(44, 68),
+                     labels = function(x) paste0(x, "%"),
+                     breaks = seq(44, 68, by = 4)) +
+
+  labs(
+    title    = "Australian Credit Card Revolving Ratio: 2015–2026",
+    subtitle = "Share of total balances accruing interest monthly  |  Red shading = RBA rate hike cycle  |  Green shading = rate cut period",
+    x        = NULL,
+    y        = "Revolving Ratio (%)",
+    caption  = "Source: RBA Statistical Table C1 (rba.gov.au)  |  Revolving ratio = Balances accruing interest / Total balances  |  Analysis by Shah Md Anasullah"
+  ) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 14),
+    plot.subtitle      = element_text(colour = "grey40", size = 9),
+    plot.caption       = element_text(colour = "grey50", size = 8),
+    panel.grid.minor   = element_blank(),
+    panel.grid.major.x = element_blank(),
+    axis.text.x        = element_text(angle = 45, hjust = 1)
+  )
+
+print(p)
+```
+
+```{r nab-bar-chart}
+
+# ── Australian Debt Prevalence by Type — NAB Q4 2025 ─────────────────────────
+#
+# This chart uses published survey data from the NAB Australian Wellbeing
+# Survey Q4 2025 to show how widespread debt is across Australian households.
+#
+# The four numbers are typed directly from the published report —
+# no CSV file needed. This is a context chart, not a modelling dataset.
+#
+# It directly supports the Introduction section of the report by showing
+# that credit cards, BNPL and personal loans are all common — which is
+# why our system focuses on the combined stress pattern across all three,
+# not just credit cards alone.
+#
+# Source: NAB Australian Wellbeing Survey Q4 2025
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+nab_data <- data.frame(
+  Debt_Type  = c("Credit Card", "Mortgage", "BNPL", "Personal Loan"),
+  Percentage = c(35, 28, 20, 15)
+) %>%
+  mutate(
+    Debt_Type = factor(Debt_Type,
+                       levels = c("Personal Loan", "BNPL",
+                                  "Mortgage", "Credit Card")),
+    Highlight = ifelse(Debt_Type %in% c("Credit Card", "BNPL",
+                                         "Personal Loan"),
+                       "Project Focus", "Other")
+  )
+
+ggplot(nab_data, aes(x = Percentage, y = Debt_Type, fill = Highlight)) +
+
+  geom_bar(stat   = "identity",
+           width  = 0.55,
+           colour = "white") +
+
+  geom_text(aes(label = paste0(Percentage, "%")),
+            hjust    = -0.3,
+            size     = 4.5,
+            fontface = "bold") +
+
+  # Bracket showing project focus area
+  annotate("rect",
+           xmin  = 0,
+           xmax  = 37,
+           ymin  = 0.45,
+           ymax  = 1.55,
+           alpha = 0,
+           colour = "#E74C3C",
+           linewidth = 0.6,
+           linetype  = "dashed") +
+
+  annotate("rect",
+           xmin  = 0,
+           xmax  = 37,
+           ymin  = 2.45,
+           ymax  = 3.55,
+           alpha = 0,
+           colour = "#E74C3C",
+           linewidth = 0.6,
+           linetype  = "dashed") +
+
+  annotate("text",
+           x        = 36,
+           y        = 1,
+           label    = "Project\nfocus",
+           size     = 3,
+           colour   = "#E74C3C",
+           fontface = "italic",
+           hjust    = 1) +
+
+  scale_fill_manual(values = c("Project Focus" = "#2471A3",
+                                "Other"         = "#AEB6BF")) +
+
+  scale_x_continuous(limits = c(0, 45),
+                     labels = function(x) paste0(x, "%")) +
+
+  labs(
+    title    = "Debt Type Prevalence Among Australian Adults",
+    subtitle = "Percentage of Australians currently holding each debt type",
+    x        = "Percentage of Australian Adults (%)",
+    y        = NULL,
+    caption  = "Source: NAB Australian Wellbeing Survey Q4 2025"
+  ) +
+
+  theme_minimal(base_size = 13) +
+  theme(
+    legend.position    = "none",
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40", size = 10),
+    panel.grid.major.y = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+```
+
+
+```{r probability-flag-mapping}
+
+# ── Mapping Model Probabilities to Flag Categories ────────────────────────────
+#
+# The ML model predicts a probability of default for each customer.
+# The Invisible Debt Trap Flag is the business-facing output. It converts
+# the predicted probability into a simple risk category that a user can
+# understand: Stable, Watch, Early Flag, or High Risk.
+#
+# For this demonstration, we use the Classification Tree because it achieved
+# the strongest recall among the tested models. Recall is important here
+# because the project is designed as an early warning system, where missing
+# a genuinely risky customer is more harmful than flagging too cautiously.
+#
+# The probability bands are estimated from the training prediction distribution
+# and then applied to the test set. This avoids designing the flag thresholds
+# directly from the test data.
+#
+# These bands are demonstration thresholds only. A real Australian system
+# would need calibration using local customer-consented data from statements
+# or CDR/open banking.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# Step 1 — Get predicted probabilities from the Classification Tree
+# We already have pred_tree_prob from model training
+# Column "Default" contains the probability of default for each customer
+
+default_probs_test <- pred_tree_prob[, "Default"]
+
+cat("Predicted probability summary on test set:\n")
+print(summary(default_probs_test))
+cat("\n")
+
+
+# Step 2 — Get training predictions to set probability band thresholds
+# We use the saved cross-validation predictions from the training phase
+# This ensures our bands are defined from training data, not test data
+
+train_cv_probs <- model_tree$pred %>%
+  filter(cp == model_tree$bestTune$cp) %>%
+  pull(Default)
+
+# If CV predictions are not available, use training set predictions directly
+if (length(train_cv_probs) == 0) {
+  train_cv_probs <- predict(model_tree,
+                             newdata = train_data,
+                             type    = "prob")[, "Default"]
+}
+
+cat("Training probability distribution (used to set band thresholds):\n")
+print(quantile(train_cv_probs,
+               probs = c(0.25, 0.40, 0.60, 0.75, 0.90)))
+cat("\n")
+
+
+# Step 3 — Define probability bands from training distribution
+# We use natural breaks in the training probability distribution
+# rather than arbitrary fixed values
+
+threshold_watch      <- round(quantile(train_cv_probs, 0.40), 3)
+threshold_early_flag <- round(quantile(train_cv_probs, 0.65), 3)
+threshold_high_risk  <- round(quantile(train_cv_probs, 0.82), 3)
+
+cat("Probability band thresholds (from training distribution):\n")
+cat("Stable:     probability < ", threshold_watch, "\n")
+cat("Watch:      probability ", threshold_watch,
+    "to <", threshold_early_flag, "\n")
+cat("Early Flag: probability ", threshold_early_flag,
+    "to <", threshold_high_risk, "\n")
+cat("High Risk:  probability >=", threshold_high_risk, "\n\n")
+
+
+# Step 4 — Apply thresholds to test set probabilities
+test_flag_mapped <- data.frame(
+  Actual_Default = test_data$DEFAULT,
+  Default_Prob   = default_probs_test
+) %>%
+  mutate(
+    ML_Flag = case_when(
+      Default_Prob >= threshold_high_risk  ~ "High Risk",
+      Default_Prob >= threshold_early_flag ~ "Early Flag",
+      Default_Prob >= threshold_watch      ~ "Watch",
+      TRUE                                 ~ "Stable"
+    ),
+    ML_Flag = factor(ML_Flag,
+                     levels  = c("Stable", "Watch",
+                                 "Early Flag", "High Risk"),
+                     ordered = TRUE)
+  )
+
+
+# Step 5 — Check flag distribution and default rates per flag
+cat("=== ML PROBABILITY FLAG DISTRIBUTION ===\n\n")
+
+flag_summary <- test_flag_mapped %>%
+  group_by(ML_Flag) %>%
+  summarise(
+    Customers    = n(),
+    Pct          = round(n() / nrow(test_flag_mapped) * 100, 1),
+    Avg_Prob     = round(mean(Default_Prob) * 100, 1),
+    Default_Rate = round(mean(Actual_Default == "Default") * 100, 1)
+  )
+
+print(flag_summary)
+cat("\n")
+cat("Note: Default rate should increase from Stable to High Risk.\n")
+cat("This validates that probability bands are meaningful.\n")
+```
+
+```{r probability-mapping-chart}
+
+# ── Visualising the Probability-to-Flag Mapping ───────────────────────────────
+#
+# Two charts side by side:
+# Left: distribution of predicted probabilities coloured by flag category
+# Right: default rate per flag category with customer counts
+#
+# Together they show both HOW the probabilities are distributed AND
+# whether the flag categories are genuinely separating risk levels.
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+flag_colours <- c("Stable"     = "#27AE60",
+                  "Watch"      = "#F39C12",
+                  "Early Flag" = "#E67E22",
+                  "High Risk"  = "#C0392B")
+
+# ── Left chart — probability distribution by flag ────────────────────────────
+
+p_left <- ggplot(test_flag_mapped,
+                 aes(x = Default_Prob, fill = ML_Flag)) +
+
+  geom_histogram(bins     = 40,
+                 colour   = "white",
+                 linewidth = 0.2) +
+
+  geom_vline(xintercept = threshold_watch,
+             linetype   = "dashed",
+             colour     = "grey40",
+             linewidth  = 0.7) +
+
+  geom_vline(xintercept = threshold_early_flag,
+             linetype   = "dashed",
+             colour     = "grey40",
+             linewidth  = 0.7) +
+
+  geom_vline(xintercept = threshold_high_risk,
+             linetype   = "dashed",
+             colour     = "grey40",
+             linewidth  = 0.7) +
+
+  scale_fill_manual(values = flag_colours) +
+
+  scale_x_continuous(
+    labels = function(x) paste0(round(x * 100), "%"),
+    limits = c(0.2, 0.95)
+  ) +
+
+  scale_y_continuous(labels = comma) +
+
+  labs(
+    title    = "Predicted Default Probability Distribution",
+    subtitle = "Colour shows assigned flag category",
+    x        = "Predicted Probability of Default",
+    y        = "Number of Customers",
+    fill     = NULL
+  ) +
+
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title       = element_text(face = "bold", size = 11),
+    legend.position  = "bottom",
+    panel.grid.minor = element_blank()
+  )
+
+
+# ── Right chart — default rate by flag with counts ───────────────────────────
+
+p_right <- flag_summary %>%
+  ggplot(aes(x = ML_Flag, y = Default_Rate, fill = ML_Flag)) +
+
+  geom_bar(stat   = "identity",
+           width  = 0.55,
+           colour = "white") +
+
+  geom_text(aes(label = paste0(Default_Rate, "%\n(n=", comma(Customers), ")")),
+            vjust    = -0.3,
+            size     = 3.5,
+            fontface = "bold") +
+
+  scale_fill_manual(values = flag_colours) +
+
+  scale_y_continuous(
+    limits = c(0, 75),
+    labels = function(x) paste0(x, "%")
+  ) +
+
+  labs(
+    title    = "Default Rate by Flag Category",
+    subtitle = "Validates probability bands are meaningful",
+    x        = NULL,
+    y        = "Actual Default Rate (%)",
+    fill     = NULL
+  ) +
+
+  theme_minimal(base_size = 11) +
+  theme(
+    plot.title         = element_text(face = "bold", size = 11),
+    legend.position    = "none",
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+
+# ── Combine both charts ───────────────────────────────────────────────────────
+
+grid.arrange(
+  p_left, p_right,
+  ncol = 2,
+  top  = grid::textGrob(
+    "Invisible Debt Trap Flag — Probability Mapping Validation",
+    gp = grid::gpar(fontface = "bold", fontsize = 13)
+  )
+)
+```
+
+```{r detection-gap-chart}
+
+# ── Detection Gap Chart ───────────────────────────────────────────────────────
+#
+# This chart makes the core novelty argument of the project with real data.
+#
+# Part A — Calibration diagram:
+# Shows that as the model's predicted probability rises, actual default
+# rates rise in lockstep. This proves the model is capturing genuine risk.
+# The shaded zones show where the Invisible Debt Trap Flag categories sit.
+#
+# Part B — Detection gap comparison:
+# Compares two detection approaches on the same test set:
+# 1. Traditional proxy: only flags customers already missing payments
+#    (PAY_DELAY_COUNT >= 2 — equivalent to ASIC serious delinquency)
+# 2. Our AI early warning: flags Watch and Early Flag customers who
+#    have ZERO payment delays — the invisible stressed customers that
+#    traditional monitoring completely misses
+#
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+# ── Step 1: Add PAY_DELAY_COUNT back into the mapped test set ─────────────────
+
+test_flag_mapped$PAY_DELAY_COUNT <- test_data$PAY_DELAY_COUNT
+
+
+# ── Step 2: Create 10 probability bands and calculate actual default rates ────
+
+calibration_data <- test_flag_mapped %>%
+  mutate(
+    Prob_Band = cut(Default_Prob,
+                   breaks = seq(0.25, 0.95, by = 0.07),
+                   include.lowest = TRUE,
+                   right          = FALSE)
+  ) %>%
+  group_by(Prob_Band) %>%
+  summarise(
+    Customers    = n(),
+    Actual_Rate  = round(mean(Actual_Default == "Default") * 100, 1),
+    Avg_Prob     = round(mean(Default_Prob) * 100, 1)
+  ) %>%
+  filter(!is.na(Prob_Band))
+
+cat("Calibration data by probability band:\n")
+print(calibration_data)
+cat("\n")
+
+
+# ── Step 3: Part A — Calibration reliability diagram ─────────────────────────
+
+p_calibration <- ggplot(calibration_data,
+                         aes(x = Avg_Prob, y = Actual_Rate)) +
+
+  # Shaded zones
+  annotate("rect", xmin = 25, xmax = 40,
+           ymin = 0, ymax = 100,
+           alpha = 0.07, fill = "#27AE60") +
+
+  annotate("rect", xmin = 40, xmax = 62,
+           ymin = 0, ymax = 100,
+           alpha = 0.07, fill = "#F39C12") +
+
+  annotate("rect", xmin = 62, xmax = 95,
+           ymin = 0, ymax = 100,
+           alpha = 0.08, fill = "#C0392B") +
+
+  # Zone labels
+  annotate("text", x = 33, y = 90,
+           label = "Stable\nZone",
+           size = 3, colour = "#27AE60", fontface = "bold") +
+
+  annotate("text", x = 51, y = 90,
+           label = "Early\nWarning\nZone",
+           size = 3, colour = "#E67E22", fontface = "bold") +
+
+  annotate("text", x = 78, y = 90,
+           label = "High\nRisk\nZone",
+           size = 3, colour = "#C0392B", fontface = "bold") +
+
+  # Perfect calibration reference line
+  geom_abline(slope     = 1,
+              intercept = 0,
+              linetype  = "dashed",
+              colour    = "grey60",
+              linewidth = 0.8) +
+
+  # Actual calibration line
+  geom_line(colour    = "#2C3E50",
+            linewidth = 1.2) +
+
+  geom_point(aes(size = Customers),
+             colour = "#2C3E50",
+             alpha  = 0.85) +
+
+  geom_text(aes(label = paste0(Actual_Rate, "%")),
+            vjust  = -1.2,
+            size   = 3.2,
+            colour = "#2C3E50",
+            fontface = "bold") +
+
+  scale_size_continuous(range = c(3, 9), guide = "none") +
+
+  scale_x_continuous(limits = c(25, 95),
+                     labels = function(x) paste0(x, "%")) +
+
+  scale_y_continuous(limits = c(0, 100),
+                     labels = function(x) paste0(x, "%")) +
+
+  labs(
+    title    = "Model Calibration — Predicted vs Actual Default Rate",
+    subtitle = "Each point = one probability band | Point size = number of customers",
+    x        = "Predicted Default Probability (%)",
+    y        = "Actual Default Rate (%)",
+    caption  = "Dashed line = perfect calibration"
+  ) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title    = element_text(face = "bold"),
+    plot.subtitle = element_text(colour = "grey40", size = 9),
+    panel.grid.minor = element_blank()
+  )
+
+
+# ── Step 4: Part B — Detection gap comparison ─────────────────────────────────
+#
+# We compare two groups:
+# Group 1 — Traditional proxy: PAY_DELAY_COUNT >= 2
+#            These customers are already missing payments
+#            Traditional monitoring catches them here
+#
+# Group 2 — AI early warning gap: Watch or Early Flag with zero delays
+#            These customers show behavioural stress but no missed payments yet
+#            Traditional monitoring completely misses these customers
+
+traditional_group <- test_flag_mapped %>%
+  filter(PAY_DELAY_COUNT >= 2)
+
+ai_gap_group <- test_flag_mapped %>%
+  filter(ML_Flag %in% c("Watch", "Early Flag"),
+         PAY_DELAY_COUNT == 0)
+
+comparison_data <- data.frame(
+  Group        = c("Traditional Proxy\n(PAY_DELAY >= 2)",
+                   "AI Early Warning Gap\n(Watch/Early Flag, no delays)"),
+  Customers    = c(nrow(traditional_group), nrow(ai_gap_group)),
+  Default_Rate = c(
+    round(mean(traditional_group$Actual_Default == "Default") * 100, 1),
+    round(mean(ai_gap_group$Actual_Default    == "Default") * 100, 1)
+  ),
+  Type = c("Traditional", "AI Gap")
+)
+
+cat("Detection gap comparison:\n")
+print(comparison_data)
+cat("\n")
+cat("AI early warning gap customers — invisible to traditional systems:\n")
+cat("Total customers our system catches early:", nrow(ai_gap_group), "\n")
+cat("Their actual default rate:", comparison_data$Default_Rate[2], "%\n")
+cat("Without our system these customers receive no warning\n\n")
+
+
+p_gap <- ggplot(comparison_data,
+                aes(x = Group, y = Customers, fill = Type)) +
+
+  geom_bar(stat   = "identity",
+           width  = 0.5,
+           colour = "white") +
+
+  geom_text(aes(label = paste0(comma(Customers),
+                                "\ncustomers\n(",
+                                Default_Rate, "% default)")),
+            vjust    = -0.3,
+            size     = 3.5,
+            fontface = "bold") +
+
+  scale_fill_manual(values = c("Traditional" = "#AEB6BF",
+                                "AI Gap"      = "#2471A3")) +
+
+  scale_y_continuous(labels = comma,
+                     limits = c(0, max(comparison_data$Customers) * 1.35)) +
+
+  labs(
+    title    = "Detection Gap — What Traditional Systems Miss",
+    subtitle = "Blue = customers our AI system catches before any payment delay occurs",
+    x        = NULL,
+    y        = "Number of Customers",
+    caption  = "Traditional proxy = PAY_DELAY_COUNT >= 2 | AI gap = Watch/Early Flag with zero delays"
+  ) +
+
+  theme_minimal(base_size = 12) +
+  theme(
+    legend.position    = "none",
+    plot.title         = element_text(face = "bold"),
+    plot.subtitle      = element_text(colour = "grey40", size = 9),
+    panel.grid.major.x = element_blank(),
+    panel.grid.minor   = element_blank()
+  )
+
+
+# ── Step 5: Combine both charts ───────────────────────────────────────────────
+
+grid.arrange(
+  p_calibration, p_gap,
+  ncol = 2,
+  top  = grid::textGrob(
+    "Invisible Debt Trap Analytics — Detection Gap Evidence",
+    gp = grid::gpar(fontface = "bold", fontsize = 13)
+  )
+)
+```
+
+
+
